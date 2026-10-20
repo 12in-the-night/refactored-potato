@@ -1,5 +1,7 @@
 import os
 
+# Enforce TPU and memory optimization BEFORE importing JAX
+os.environ["JAX_PLATFORMS"] = "tpu"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
@@ -19,19 +21,28 @@ from scipy import ndimage
 from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 
+# --- CPU OPTIMIZATION ---
 cv2.setNumThreads(0)
 
 # ============================================================
-# 1. LOAD YAML CONFIG & DETECT ENVIRONMENT
+# 1. VERIFY TPU & LOAD CONFIG
 # ============================================================
+try:
+    devices = jax.devices()
+    is_tpu = devices[0].platform == 'tpu'
+except Exception:
+    is_tpu = False
+
+if is_tpu:
+    print(f"✅ Confirmed: Running on {len(devices)} TPU devices.")
+else:
+    print(f"⚠️ Warning: Running on {devices[0].platform.upper()} (Expected TPU).")
+
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-KAGGLE_BASE = cfg['paths']['kaggle_base']
-LOCAL_BASE = cfg['paths']['local_base']
-IS_KAGGLE = os.path.exists(KAGGLE_BASE)
-BASE = KAGGLE_BASE if IS_KAGGLE else LOCAL_BASE
-
+IS_KAGGLE = os.path.exists(cfg['paths']['kaggle_base'])
+BASE = cfg['paths']['kaggle_base'] if IS_KAGGLE else cfg['paths']['local_base']
 CHUNK_DIR = cfg['paths']['kaggle_chunks'] if IS_KAGGLE else cfg['paths']['local_chunks']
 VAL_DIR = cfg['paths']['kaggle_chunks_val'] if IS_KAGGLE else cfg['paths']['local_chunks_val']
 
@@ -43,14 +54,19 @@ SEED = cfg['hyperparameters']['seed']
 
 NUM_DEVICES = jax.local_device_count()
 GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
+CHECKPOINT_DIR = "./checkpoints" if not IS_KAGGLE else "/kaggle/working/checkpoints"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
+# Verify datasets are attached
+assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR}. Attach solar-chunks dataset."
+assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR}. Attach solar-chunks dataset."
+if IS_KAGGLE:
+    assert os.path.isdir(os.path.join(BASE, cfg['paths']['test_img'])), f"Missing test images. Attach competition dataset."
+
 print(f"Environment: {'Kaggle' if IS_KAGGLE else 'Local'} | Devices: {NUM_DEVICES} | Batch: {GLOBAL_BATCH_SIZE}")
 
-assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR} — attach solar-chunks dataset"
-assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR} — attach solar-chunks dataset"
-assert os.path.isdir(os.path.join(BASE, cfg['paths']['test_img'])), f"Missing raw test images — attach competition dataset"
-
 # ============================================================
-# 2. DATASET
+# 2. DATASET (ZERO-HICCUP NUMPY MEMORY MAPPING)
 # ============================================================
 class SolarFilamentDataset(Dataset):
     def __init__(self, chunk_dir, augment=False):
@@ -70,10 +86,12 @@ class SolarFilamentDataset(Dataset):
         mask = np.load(os.path.join(self.chunk_dir, mask_file), mmap_mode='r').copy()
 
         if self.augment:
+            # 1. Flips & Rotations
             if np.random.rand() > 0.5: img, mask = np.fliplr(img), np.fliplr(mask)
             if np.random.rand() > 0.5: img, mask = np.flipud(img), np.flipud(mask)
             if np.random.rand() > 0.5: img, mask = np.rot90(img).copy(), np.rot90(mask).copy()
 
+            # 2. Photometric (Gamma + Noise)
             if np.random.rand() > 0.5:
                 gamma = np.random.uniform(0.7, 1.3)
                 img = np.clip(img ** gamma, 0, 1)
@@ -81,6 +99,7 @@ class SolarFilamentDataset(Dataset):
                 noise = np.random.randn(*img.shape).astype(np.float32) * 0.05
                 img = np.clip(img + img * noise, 0, 1)
 
+            # 3. Coarse Dropout
             if np.random.rand() > 0.3:
                 for _ in range(np.random.randint(1, 4)):
                     drop_size = np.random.randint(16, 48)
@@ -89,6 +108,7 @@ class SolarFilamentDataset(Dataset):
                     img[dy:dy+drop_size, dx:dx+drop_size] = 0.0
                     mask[dy:dy+drop_size, dx:dx+drop_size] = 0.0
 
+            # 4. Elastic Deformation
             if np.random.rand() > 0.85:
                 alpha = IMG_SIZE * 0.05
                 sigma = IMG_SIZE * 0.05
@@ -107,24 +127,13 @@ train_dataset = SolarFilamentDataset(CHUNK_DIR, augment=True)
 val_dataset = SolarFilamentDataset(VAL_DIR, augment=False)
 
 train_loader = DataLoader(
-    train_dataset,
-    batch_size=GLOBAL_BATCH_SIZE,
-    shuffle=True,
-    drop_last=True,
-    num_workers=4,
-    persistent_workers=True,
-    prefetch_factor=4,
-    pin_memory=False,
+    train_dataset, batch_size=GLOBAL_BATCH_SIZE, shuffle=True, drop_last=True,
+    num_workers=4, persistent_workers=True, prefetch_factor=4, pin_memory=False,
 )
 
 val_loader = DataLoader(
-    val_dataset,
-    batch_size=GLOBAL_BATCH_SIZE,
-    shuffle=False,
-    drop_last=False,
-    num_workers=2,
-    persistent_workers=True,
-    pin_memory=False,
+    val_dataset, batch_size=GLOBAL_BATCH_SIZE, shuffle=False, drop_last=False,
+    num_workers=2, persistent_workers=True, pin_memory=False,
 )
 
 # ============================================================
@@ -175,7 +184,7 @@ class UNet(eqx.Module):
         return self.out_conv(x1_up)
 
 # ============================================================
-# 4. LOSSES
+# 4. LOSSES & TRAIN STEP
 # ============================================================
 def focal_loss(preds, targets, alpha=0.8, gamma=2.0):
     bce = optax.sigmoid_binary_cross_entropy(preds, targets)
@@ -194,9 +203,6 @@ def boundary_loss(preds, targets):
     bce = optax.sigmoid_binary_cross_entropy(preds, targets)
     return jnp.mean(bce * (1.0 + 5.0 * t_edges))
 
-# ============================================================
-# 5. TPU TRAIN STEP (EMA + bfloat16)
-# ============================================================
 @eqx.filter_pmap(axis_name='batch')
 def train_step(model, ema_model, opt_state, x, y, optimizer, ema_decay=0.999):
     def loss_fn(model, x, y):
@@ -209,9 +215,7 @@ def train_step(model, ema_model, opt_state, x, y, optimizer, ema_decay=0.999):
 
     updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
     model = eqx.apply_updates(model, updates)
-
     ema_model = jax.tree_util.tree_map(lambda e, m: ema_decay * e + (1 - ema_decay) * m, ema_model, model)
-
     return model, ema_model, opt_state, jax.lax.pmean(loss, axis_name='batch')
 
 @eqx.filter_jit
@@ -220,19 +224,15 @@ def eval_step(model, x, y):
     return dice_loss(preds, y)
 
 def validate(pmodel):
-    model_single = jax.tree_util.tree_map(
-        lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES else x,
-        pmodel,
-    )
+    model_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES else x, pmodel)
     losses = []
     for imgs, masks in val_loader:
-        x = jnp.array(imgs.numpy())
-        y = jnp.array(masks.numpy())
+        x, y = jnp.array(imgs.numpy()), jnp.array(masks.numpy())
         losses.append(float(eval_step(model_single, x, y)))
     return float(np.mean(losses))
 
 # ============================================================
-# 6. POST-PROCESSING & INFERENCE
+# 5. POST-PROCESSING & INFERENCE
 # ============================================================
 def rle_encode(mask):
     pixels = mask.flatten()
@@ -249,12 +249,10 @@ def elite_watershed(binary_mask):
     return (labels > 0).astype(np.uint8)
 
 def generate_submission(model):
-    print("Generating submission (batched inference)...")
+    print("Generating submission...")
     test_img_dir = os.path.join(BASE, cfg['paths']['test_img'])
     test_files = sorted([f for f in os.listdir(test_img_dir) if f.endswith('.jpeg')])
     results = []
-
-    batch_size_inference = 32
 
     @eqx.filter_jit
     def predict_batch(imgs):
@@ -263,31 +261,27 @@ def generate_submission(model):
 
     hann_1d = np.hanning(IMG_SIZE)
     window_weight = np.maximum(np.outer(hann_1d, hann_1d), 0.01)
-
     stride = 256; window = IMG_SIZE; pad_size = 256
 
     for idx, fname in enumerate(test_files):
-        full_img = Image.open(os.path.join(test_img_dir, fname)).convert('L')
-        full_img = np.array(full_img, dtype=np.float32) / 255.0
-
+        full_img = np.array(Image.open(os.path.join(test_img_dir, fname)).convert('L'), dtype=np.float32) / 255.0
         padded_img = cv2.copyMakeBorder(full_img, pad_size, pad_size, pad_size, pad_size, cv2.BORDER_REFLECT)
         padded_size = padded_img.shape[0]
 
         full_mask = np.zeros((padded_size, padded_size), dtype=np.float32)
         weight_sum = np.zeros((padded_size, padded_size), dtype=np.float32)
 
-        chunks = []
-        coords = []
+        chunks, coords = [], []
         for y in range(0, padded_size - window + 1, stride):
             for x in range(0, padded_size - window + 1, stride):
                 chunks.append(padded_img[y:y+window, x:x+window])
                 coords.append((y, x))
 
         chunks = np.array(chunks)[:, np.newaxis, :, :]
-
         preds = []
-        for i in range(0, len(chunks), batch_size_inference):
-            batch_chunks = jnp.array(chunks[i:i+batch_size_inference])
+
+        for i in range(0, len(chunks), 32):
+            batch_chunks = jnp.array(chunks[i:i+32])
             p1 = np.array(predict_batch(batch_chunks))
             p2 = np.flip(np.array(predict_batch(jnp.flip(batch_chunks, axis=3))), axis=3)
             preds.append((p1 + p2) / 2.0)
@@ -300,7 +294,6 @@ def generate_submission(model):
 
         full_mask = full_mask / np.maximum(weight_sum, 1e-5)
         full_mask = full_mask[pad_size:pad_size+2048, pad_size:pad_size+2048]
-
         full_mask = cv2.GaussianBlur(full_mask, (5, 5), 1.0)
         binary_mask = (full_mask > 0.5).astype(np.uint8)
 
@@ -310,42 +303,36 @@ def generate_submission(model):
                 binary_mask[labels == i] = 0
 
         binary_mask = elite_watershed(binary_mask)
-        kernel = np.ones((3, 3), np.uint8)
-        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
-
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
         results.append({'id': fname.replace('.jpeg', ''), 'segmentation_rle': rle_encode(binary_mask)})
-        if idx % 20 == 0:
-            print(f"Processed {idx+1}/{len(test_files)}")
+
+        if idx % 20 == 0: print(f"Processed {idx+1}/{len(test_files)}")
 
     pd.DataFrame(results).to_csv('submission.csv', index=False)
     print("Submission saved successfully!")
 
 # ============================================================
-# 7. MAIN
+# 6. MAIN EXECUTION WITH CHECKPOINTING
 # ============================================================
 if __name__ == "__main__":
     key = jax.random.PRNGKey(SEED)
-
     total_steps = (len(train_dataset) // GLOBAL_BATCH_SIZE) * EPOCHS
-    schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=LR, warmup_steps=100, decay_steps=total_steps, end_value=1e-5,
-    )
+    schedule = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=LR, warmup_steps=100, decay_steps=total_steps, end_value=1e-5)
     optimizer = optax.adam(learning_rate=schedule)
 
     model = UNet(in_channels=1, out_channels=1, key=key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
     ema_model = jax.tree_util.tree_map(lambda x: x, model)
 
-    model, ema_model = jax.tree_util.tree_map(
-        lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape) if eqx.is_array(x) else x,
-        (model, ema_model),
-    )
-    opt_state = jax.tree_util.tree_map(
-        lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape) if eqx.is_array(x) else x,
-        opt_state,
-    )
+    model, ema_model = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape) if eqx.is_array(x) else x, (model, ema_model))
+    opt_state = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape) if eqx.is_array(x) else x, opt_state)
 
-    print(f"Starting training for {EPOCHS} epochs | train={len(train_dataset)} val={len(val_dataset)}")
+    print(f"Starting training for {EPOCHS} epochs | Train size: {len(train_dataset)} | Val size: {len(val_dataset)}")
+
+    best_val_loss = float('inf')
+    saved_checkpoints = []
+    ema_single = None
+
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
         for batch_idx, (imgs, masks) in enumerate(train_loader):
@@ -362,6 +349,35 @@ if __name__ == "__main__":
         val_loss = validate(ema_model)
         print(f"Epoch {epoch+1} | Train {train_loss:.4f} | Val {val_loss:.4f}")
 
-    print("Training complete. Extracting EMA shadow model...")
-    ema_model = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, ema_model)
-    generate_submission(ema_model)
+        # --- CHECKPOINTING ---
+        ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, ema_model)
+
+        ckpt_path = os.path.join(CHECKPOINT_DIR, f"ema_epoch_{epoch+1}.eqx")
+        eqx.tree_serialise_leaves(ckpt_path, ema_single)
+        saved_checkpoints.append(ckpt_path)
+        print(f"  -> Saved checkpoint: {ckpt_path}")
+
+        if len(saved_checkpoints) > 3:
+            old_ckpt = saved_checkpoints.pop(0)
+            if os.path.exists(old_ckpt):
+                os.remove(old_ckpt)
+                print(f"  -> Deleted old checkpoint: {old_ckpt}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_path = os.path.join(CHECKPOINT_DIR, "ema_best.eqx")
+            eqx.tree_serialise_leaves(best_path, ema_single)
+            print(f"  -> New best model! Val Loss: {best_val_loss:.4f} saved to {best_path}")
+
+    # --- INFERENCE USING BEST MODEL ---
+    print("Training complete. Loading the best EMA shadow model...")
+    best_path = os.path.join(CHECKPOINT_DIR, "ema_best.eqx")
+
+    if os.path.exists(best_path):
+        best_model = eqx.tree_deserialise_leaves(best_path, ema_single)
+        print("Loaded best checkpoint successfully.")
+    else:
+        print("Warning: Best checkpoint not found. Using final epoch weights.")
+        best_model = ema_single
+
+    generate_submission(best_model)
