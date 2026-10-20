@@ -1,13 +1,17 @@
 paths:
-  kaggle_base: "/kaggle/input/competitions/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026" # Path used on Kaggle
-  local_base: "./data/MAGFiLO_1.0_Kaggle_2026" # Path used locally
-  train_img: "train/train_images" # Training images folder
-  ann_file: "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json" # Annotations JSON
-  test_img: "test/test_images" # Test images folder
+  kaggle_base: "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026"
+  local_base: "./data/MAGFiLO_1.0_Kaggle_2026"
+  kaggle_chunks: "/kaggle/input/solar-chunks/preprocessed_chunks"
+  kaggle_chunks_val: "/kaggle/input/solar-chunks/preprocessed_chunks_val"
+  local_chunks: "./data/preprocessed_chunks"
+  local_chunks_val: "./data/preprocessed_chunks_val"
+  train_img: "train/train_images"
+  ann_file: "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json"
+  test_img: "test/test_images"
 
 hyperparameters:
-  img_size: 512        # Chunk size
-  per_device_batch: 2  # 2 per TPU core (2 * 8 = 16 global)
-  epochs: 20           # Training length
-  learning_rate: 0.001 # Peak LR
-  seed: 42             # Random seed
+  img_size: 512
+  per_device_batch: 2
+  epochs: 20
+  learning_rate: 0.001
+  seed: 42
