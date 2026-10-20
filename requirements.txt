@@ -1,0 +1,9 @@
+jax[cpu]
+equinox
+optax
+pyyaml
+Pillow
+opencv-python
+pandas
+torch
+pycocotools

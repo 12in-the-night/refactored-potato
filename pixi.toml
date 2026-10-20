@@ -1,0 +1,19 @@
+[workspace]
+authors = ["jein <darshgupta71@gmail.com>"]
+channels = ["conda-forge"]
+name = "solar"
+platforms = ["win-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+jax[cpu]="*"
+equinox="*"
+optax="*"
+pyyaml="*"
+Pillow="*"
+opencv-python="*"
+pandas="*"
+torch="*"
+pycocotools ="*"
