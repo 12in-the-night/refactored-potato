@@ -14,4 +14,4 @@ hyperparameters:
   per_device_batch: 2
   epochs: 20
   learning_rate: 0.001
-  seed: 42
+  seed: 13
