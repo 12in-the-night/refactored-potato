@@ -8,12 +8,20 @@ version = "0.1.0"
 [tasks]
 
 [dependencies]
-jax[cpu] ="*"
-equinox ="*"
-optax ="*"
-pyyaml ="*"
-Pillow ="*"
-opencv-python ="*"
-pandas ="*"
-torch ="*"
-pycocotools ="*"
+# Conda packages (these work fine on Windows)
+python = "*"
+pyyaml = "*"
+pillow = "*"
+opencv = "*"
+pandas = "*"
+pytorch = "*"
+scikit-image = "*"
+pycocotools = "*"
+maturin ="*"
+tqdm = "*"
+
+[target.win-64.pypi-dependencies]
+# PyPI packages (JAX ecosystem must come from pip on Windows)
+jax = { version = "*", extras = ["cpu"] }
+equinox = "*"
+optax = "*"
