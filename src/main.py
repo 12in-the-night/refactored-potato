@@ -20,8 +20,8 @@ import pandas as pd
 from scipy import ndimage
 from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
+from tensorboardX import SummaryWriter
 
-# --- CPU OPTIMIZATION ---
 cv2.setNumThreads(0)
 
 # ============================================================
@@ -54,10 +54,12 @@ SEED = cfg['hyperparameters']['seed']
 
 NUM_DEVICES = jax.local_device_count()
 GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
-CHECKPOINT_DIR = "./checkpoints" if not IS_KAGGLE else "/kaggle/working/checkpoints"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# Verify datasets are attached
+CHECKPOINT_DIR = "./checkpoints" if not IS_KAGGLE else "/kaggle/working/checkpoints"
+LOG_DIR = "./tensorboard" if not IS_KAGGLE else "/kaggle/working/logs"
+os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
 assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR}. Attach solar-chunks dataset."
 assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR}. Attach solar-chunks dataset."
 if IS_KAGGLE:
@@ -66,7 +68,7 @@ if IS_KAGGLE:
 print(f"Environment: {'Kaggle' if IS_KAGGLE else 'Local'} | Devices: {NUM_DEVICES} | Batch: {GLOBAL_BATCH_SIZE}")
 
 # ============================================================
-# 2. DATASET (ZERO-HICCUP NUMPY MEMORY MAPPING)
+# 2. DATASET (PyTorch DataLoader)
 # ============================================================
 class SolarFilamentDataset(Dataset):
     def __init__(self, chunk_dir, augment=False):
@@ -86,12 +88,10 @@ class SolarFilamentDataset(Dataset):
         mask = np.load(os.path.join(self.chunk_dir, mask_file), mmap_mode='r').copy()
 
         if self.augment:
-            # 1. Flips & Rotations
             if np.random.rand() > 0.5: img, mask = np.fliplr(img), np.fliplr(mask)
             if np.random.rand() > 0.5: img, mask = np.flipud(img), np.flipud(mask)
             if np.random.rand() > 0.5: img, mask = np.rot90(img).copy(), np.rot90(mask).copy()
 
-            # 2. Photometric (Gamma + Noise)
             if np.random.rand() > 0.5:
                 gamma = np.random.uniform(0.7, 1.3)
                 img = np.clip(img ** gamma, 0, 1)
@@ -99,7 +99,6 @@ class SolarFilamentDataset(Dataset):
                 noise = np.random.randn(*img.shape).astype(np.float32) * 0.05
                 img = np.clip(img + img * noise, 0, 1)
 
-            # 3. Coarse Dropout
             if np.random.rand() > 0.3:
                 for _ in range(np.random.randint(1, 4)):
                     drop_size = np.random.randint(16, 48)
@@ -108,7 +107,6 @@ class SolarFilamentDataset(Dataset):
                     img[dy:dy+drop_size, dx:dx+drop_size] = 0.0
                     mask[dy:dy+drop_size, dx:dx+drop_size] = 0.0
 
-            # 4. Elastic Deformation
             if np.random.rand() > 0.85:
                 alpha = IMG_SIZE * 0.05
                 sigma = IMG_SIZE * 0.05
@@ -312,13 +310,19 @@ def generate_submission(model):
     print("Submission saved successfully!")
 
 # ============================================================
-# 6. MAIN EXECUTION WITH CHECKPOINTING
+# 6. MAIN EXECUTION WITH PROFILING & CHECKPOINTING
 # ============================================================
 if __name__ == "__main__":
+    writer = SummaryWriter(LOG_DIR)
+
     key = jax.random.PRNGKey(SEED)
     total_steps = (len(train_dataset) // GLOBAL_BATCH_SIZE) * EPOCHS
     schedule = optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=LR, warmup_steps=100, decay_steps=total_steps, end_value=1e-5)
-    optimizer = optax.adam(learning_rate=schedule)
+
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate=schedule)
+    )
 
     model = UNet(in_channels=1, out_channels=1, key=key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
@@ -332,22 +336,41 @@ if __name__ == "__main__":
     best_val_loss = float('inf')
     saved_checkpoints = []
     ema_single = None
+    global_step = 0
 
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
+
+        # --- XPROF PROFILER TRACE (Capture a few steps at epoch 2) ---
+        if epoch == 2:
+            print("🔍 Starting JAX Profiler trace for 5 steps...")
+            jax.profiler.start_trace(LOG_DIR)
+
         for batch_idx, (imgs, masks) in enumerate(train_loader):
             x = jnp.array(imgs.numpy()).reshape(NUM_DEVICES, PER_DEVICE_BATCH, 1, IMG_SIZE, IMG_SIZE)
             y = jnp.array(masks.numpy()).reshape(NUM_DEVICES, PER_DEVICE_BATCH, 1, IMG_SIZE, IMG_SIZE)
 
             model, ema_model, opt_state, loss = train_step(model, ema_model, opt_state, x, y, optimizer)
-            epoch_loss += jnp.mean(loss)
+            loss_val = float(jnp.mean(loss))
+            epoch_loss += loss_val
+
+            writer.add_scalar('Loss/train_batch', loss_val, global_step)
+            global_step += 1
 
             if batch_idx % 10 == 0:
-                print(f"Epoch {epoch+1} Batch {batch_idx} Loss {jnp.mean(loss):.4f}")
+                print(f"Epoch {epoch+1} Batch {batch_idx} Loss {loss_val:.4f}")
+
+            # Stop trace after 5 steps on epoch 2
+            if epoch == 2 and batch_idx == 5:
+                jax.profiler.stop_trace()
+                print("✅ Profiler trace saved. View it in TensorBoard under 'Profile'.")
 
         train_loss = float(epoch_loss / len(train_loader))
         val_loss = validate(ema_model)
         print(f"Epoch {epoch+1} | Train {train_loss:.4f} | Val {val_loss:.4f}")
+
+        writer.add_scalar('Loss/train_epoch', train_loss, epoch)
+        writer.add_scalar('Loss/val_epoch', val_loss, epoch)
 
         # --- CHECKPOINTING ---
         ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, ema_model)
@@ -368,6 +391,8 @@ if __name__ == "__main__":
             best_path = os.path.join(CHECKPOINT_DIR, "ema_best.eqx")
             eqx.tree_serialise_leaves(best_path, ema_single)
             print(f"  -> New best model! Val Loss: {best_val_loss:.4f} saved to {best_path}")
+
+    writer.close()
 
     # --- INFERENCE USING BEST MODEL ---
     print("Training complete. Loading the best EMA shadow model...")
