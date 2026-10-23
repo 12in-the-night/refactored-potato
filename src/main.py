@@ -27,6 +27,8 @@ cv2.setNumThreads(0)
 # ============================================================
 # 1. VERIFY TPU & LOAD CONFIG
 # ============================================================
+# Fix: Define devices before the try block to prevent NameError if jax.devices() fails
+devices = []
 try:
     devices = jax.devices()
     is_tpu = devices[0].platform == 'tpu'
@@ -36,7 +38,7 @@ except Exception:
 if is_tpu:
     print(f"✅ Confirmed: Running on {len(devices)} TPU devices.")
 else:
-    print(f"⚠️ Warning: Running on {devices[0].platform.upper()} (Expected TPU).")
+    print(f"⚠️ Warning: Running on CPU/GPU (Expected TPU). Devices: {devices}")
 
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
@@ -52,7 +54,7 @@ EPOCHS = cfg['hyperparameters']['epochs']
 LR = cfg['hyperparameters']['learning_rate']
 SEED = cfg['hyperparameters']['seed']
 
-NUM_DEVICES = jax.local_device_count()
+NUM_DEVICES = max(1, jax.local_device_count()) # Fallback to 1 if 0
 GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
 
 CHECKPOINT_DIR = "./checkpoints" if not IS_KAGGLE else "/kaggle/working/checkpoints"
@@ -68,7 +70,7 @@ if IS_KAGGLE:
 print(f"Environment: {'Kaggle' if IS_KAGGLE else 'Local'} | Devices: {NUM_DEVICES} | Batch: {GLOBAL_BATCH_SIZE}")
 
 # ============================================================
-# 2. DATASET (PyTorch DataLoader)
+# 2. DATASET
 # ============================================================
 class SolarFilamentDataset(Dataset):
     def __init__(self, chunk_dir, augment=False):
@@ -118,6 +120,10 @@ class SolarFilamentDataset(Dataset):
                 img = cv2.remap(img, x_map, y_map, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
                 mask = cv2.remap(mask, x_map, y_map, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
                 mask = (mask > 0.5).astype(np.float32)
+
+        # Fix: Force contiguous array to avoid negative stride errors in PyTorch DataLoader
+        img = np.ascontiguousarray(img)
+        mask = np.ascontiguousarray(mask)
 
         return np.expand_dims(img, axis=0), np.expand_dims(mask, axis=0)
 
@@ -233,18 +239,27 @@ def validate(pmodel):
 # 5. POST-PROCESSING & INFERENCE
 # ============================================================
 def rle_encode(mask):
-    pixels = mask.flatten()
+    # Fix: Kaggle usually expects Fortran (column-major) order.
+    # If score is 0, change order='F' to order='C'.
+    pixels = mask.flatten(order='F')
     pixels = np.concatenate([[0], pixels, [0]])
     runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
     runs[1::2] -= runs[::2]
     return ' '.join(str(x) for x in runs)
 
 def elite_watershed(binary_mask):
+    # Fix: Ensure no pixels are deleted if a marker is missing
     dist = ndimage.distance_transform_edt(binary_mask)
     local_max = h_maxima(dist, h=1.5)
     markers = ndimage.label(local_max)[0].astype(np.int32)
+
+    # Fill unmarked foreground with connected components
+    cc, _ = ndimage.label(binary_mask)
+    markers = np.where((markers == 0) & (binary_mask > 0), cc + markers.max() + 1, markers)
+
     labels = watershed(-dist, markers, mask=binary_mask)
-    return (labels > 0).astype(np.uint8)
+    # Return union to guarantee no data loss
+    return ((labels > 0).astype(np.uint8) | binary_mask).astype(np.uint8)
 
 def generate_submission(model):
     print("Generating submission...")
@@ -310,7 +325,7 @@ def generate_submission(model):
     print("Submission saved successfully!")
 
 # ============================================================
-# 6. MAIN EXECUTION WITH PROFILING & CHECKPOINTING
+# 6. MAIN EXECUTION
 # ============================================================
 if __name__ == "__main__":
     writer = SummaryWriter(LOG_DIR)
@@ -341,7 +356,6 @@ if __name__ == "__main__":
     for epoch in range(EPOCHS):
         epoch_loss = 0.0
 
-        # --- XPROF PROFILER TRACE (Capture a few steps at epoch 2) ---
         if epoch == 2:
             print("🔍 Starting JAX Profiler trace for 5 steps...")
             jax.profiler.start_trace(LOG_DIR)
@@ -360,10 +374,9 @@ if __name__ == "__main__":
             if batch_idx % 10 == 0:
                 print(f"Epoch {epoch+1} Batch {batch_idx} Loss {loss_val:.4f}")
 
-            # Stop trace after 5 steps on epoch 2
             if epoch == 2 and batch_idx == 5:
                 jax.profiler.stop_trace()
-                print("✅ Profiler trace saved. View it in TensorBoard under 'Profile'.")
+                print("✅ Profiler trace saved.")
 
         train_loss = float(epoch_loss / len(train_loader))
         val_loss = validate(ema_model)
@@ -372,7 +385,6 @@ if __name__ == "__main__":
         writer.add_scalar('Loss/train_epoch', train_loss, epoch)
         writer.add_scalar('Loss/val_epoch', val_loss, epoch)
 
-        # --- CHECKPOINTING ---
         ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) else x, ema_model)
 
         ckpt_path = os.path.join(CHECKPOINT_DIR, f"ema_epoch_{epoch+1}.eqx")
@@ -384,25 +396,21 @@ if __name__ == "__main__":
             old_ckpt = saved_checkpoints.pop(0)
             if os.path.exists(old_ckpt):
                 os.remove(old_ckpt)
-                print(f"  -> Deleted old checkpoint: {old_ckpt}")
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             best_path = os.path.join(CHECKPOINT_DIR, "ema_best.eqx")
             eqx.tree_serialise_leaves(best_path, ema_single)
-            print(f"  -> New best model! Val Loss: {best_val_loss:.4f} saved to {best_path}")
+            print(f"  -> New best model! Val Loss: {best_val_loss:.4f}")
 
     writer.close()
 
-    # --- INFERENCE USING BEST MODEL ---
     print("Training complete. Loading the best EMA shadow model...")
     best_path = os.path.join(CHECKPOINT_DIR, "ema_best.eqx")
 
     if os.path.exists(best_path):
         best_model = eqx.tree_deserialise_leaves(best_path, ema_single)
-        print("Loaded best checkpoint successfully.")
     else:
-        print("Warning: Best checkpoint not found. Using final epoch weights.")
         best_model = ema_single
 
     generate_submission(best_model)

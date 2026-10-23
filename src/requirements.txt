@@ -1,9 +1,12 @@
-jax[cpu]
+jax[tpu]
 equinox
 optax
 pyyaml
 Pillow
 opencv-python
 pandas
+scipy
+scikit-image
+tensorboardX
 torch
-pycocotools
+tqdm
