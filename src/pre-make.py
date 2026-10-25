@@ -16,6 +16,7 @@ VAL_DIR = "./data/preprocessed_chunks_val"
 
 IMG_SIZE = 512
 VAL_SPLIT = 0.1
+MIN_FILAMENT_AREA = 50
 NUM_WORKERS = os.cpu_count()
 SEED = 13
 
@@ -37,7 +38,6 @@ def process_image(args):
     idx, fname, is_val = args
     if not fname.endswith('.jpeg'): return 0
 
-    # Seed RNG per worker based on image index to prevent repetitive crops
     np.random.seed(idx + SEED)
 
     img_path = os.path.join(IMG_DIR, fname)
@@ -52,32 +52,45 @@ def process_image(args):
             if 'segmentation' in ann and isinstance(ann['segmentation'], list):
                 for seg in ann['segmentation']:
                     poly = np.array(seg).reshape(-1, 2)
-                    cv2.fillPoly(mask, [poly.astype(np.int32)], 1.0)
+                    if cv2.contourArea(poly.astype(np.int32)) > MIN_FILAMENT_AREA:
+                        cv2.fillPoly(mask, [poly.astype(np.int32)], 1.0)
 
     out_dir = VAL_DIR if is_val else OUT_DIR
     chunks_saved = 0
 
     if np.sum(mask) > 0:
         y_coords, x_coords = np.where(mask == 1)
-        num_crops = min(4, len(y_coords))
-        indices = np.random.choice(len(y_coords), num_crops, replace=False)
+        attempts = 0
+        while chunks_saved < 4 and attempts < 10:
+            attempts += 1
+            rand_idx = np.random.randint(0, len(y_coords))
+            cy, cx = y_coords[rand_idx], x_coords[rand_idx]
 
-        for i in indices:
-            cy, cx = y_coords[i], x_coords[i]
             x = np.clip(cx - IMG_SIZE//2, 0, 2048 - IMG_SIZE)
             y = np.clip(cy - IMG_SIZE//2, 0, 2048 - IMG_SIZE)
 
             img_chunk = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
             mask_chunk = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
 
+            if np.sum(mask_chunk) > (MIN_FILAMENT_AREA * 2):
+                np.save(os.path.join(out_dir, f"img_{idx}_{chunks_saved}.npy"), img_chunk)
+                np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask_chunk)
+                chunks_saved += 1
+
+    neg_saved = False
+    neg_attempts = 0
+    while not neg_saved and neg_attempts < 15:
+        neg_attempts += 1
+        x = np.random.randint(0, 2048 - IMG_SIZE)
+        y = np.random.randint(0, 2048 - IMG_SIZE)
+
+        img_chunk = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
+        mask_chunk = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
+
+        if np.sum(mask_chunk) == 0:
             np.save(os.path.join(out_dir, f"img_{idx}_{chunks_saved}.npy"), img_chunk)
             np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask_chunk)
-            chunks_saved += 1
-
-    x = np.random.randint(0, 2048 - IMG_SIZE)
-    y = np.random.randint(0, 2048 - IMG_SIZE)
-    np.save(os.path.join(out_dir, f"img_{idx}_{chunks_saved}.npy"), img[y:y+IMG_SIZE, x:x+IMG_SIZE])
-    np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask[y:y+IMG_SIZE, x:x+IMG_SIZE])
+            neg_saved = True
 
     return 1
 
@@ -85,7 +98,6 @@ if __name__ == "__main__":
     print(f"Starting Pre-processing with {NUM_WORKERS} CPU workers...")
     all_files = sorted([f for f in os.listdir(IMG_DIR) if f.endswith('.jpeg')])
 
-    # Split by image index, not by chunk, to prevent train/val leakage
     np.random.seed(SEED)
     val_indices = set(np.random.choice(len(all_files), int(len(all_files) * VAL_SPLIT), replace=False))
 

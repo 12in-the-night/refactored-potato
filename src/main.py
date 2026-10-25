@@ -1,13 +1,11 @@
 import os
 
-# Enforce TPU and memory optimization BEFORE importing JAX
 os.environ["JAX_PLATFORMS"] = "tpu"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import yaml
-import json
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -21,13 +19,10 @@ from scipy import ndimage
 from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 from tensorboardX import SummaryWriter
+import torch
 
 cv2.setNumThreads(0)
 
-# ============================================================
-# 1. VERIFY TPU & LOAD CONFIG
-# ============================================================
-# Fix: Define devices before the try block to prevent NameError if jax.devices() fails
 devices = []
 try:
     devices = jax.devices()
@@ -38,15 +33,20 @@ except Exception:
 if is_tpu:
     print(f"✅ Confirmed: Running on {len(devices)} TPU devices.")
 else:
-    print(f"⚠️ Warning: Running on CPU/GPU (Expected TPU). Devices: {devices}")
+    print(f"⚠️ Warning: Running on CPU/GPU. Devices: {devices}")
 
+IS_KAGGLE = os.path.exists("/kaggle/input")
 with open("config.yaml", "r") as f:
     cfg = yaml.safe_load(f)
 
-IS_KAGGLE = os.path.exists(cfg['paths']['kaggle_base'])
-BASE = cfg['paths']['kaggle_base'] if IS_KAGGLE else cfg['paths']['local_base']
-CHUNK_DIR = cfg['paths']['kaggle_chunks'] if IS_KAGGLE else cfg['paths']['local_chunks']
-VAL_DIR = cfg['paths']['kaggle_chunks_val'] if IS_KAGGLE else cfg['paths']['local_chunks_val']
+if IS_KAGGLE:
+    BASE = cfg['paths']['kaggle_base']
+    CHUNK_DIR = cfg['paths']['kaggle_chunks']
+    VAL_DIR = cfg['paths']['kaggle_chunks_val']
+else:
+    BASE = cfg['paths']['local_base']
+    CHUNK_DIR = cfg['paths']['local_chunks']
+    VAL_DIR = cfg['paths']['local_chunks_val']
 
 IMG_SIZE = cfg['hyperparameters']['img_size']
 PER_DEVICE_BATCH = cfg['hyperparameters']['per_device_batch']
@@ -54,7 +54,7 @@ EPOCHS = cfg['hyperparameters']['epochs']
 LR = cfg['hyperparameters']['learning_rate']
 SEED = cfg['hyperparameters']['seed']
 
-NUM_DEVICES = max(1, jax.local_device_count()) # Fallback to 1 if 0
+NUM_DEVICES = max(1, jax.local_device_count())
 GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
 
 CHECKPOINT_DIR = "./checkpoints" if not IS_KAGGLE else "/kaggle/working/checkpoints"
@@ -62,16 +62,13 @@ LOG_DIR = "./tensorboard" if not IS_KAGGLE else "/kaggle/working/logs"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR}. Attach solar-chunks dataset."
-assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR}. Attach solar-chunks dataset."
+assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR}."
+assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR}."
 if IS_KAGGLE:
-    assert os.path.isdir(os.path.join(BASE, cfg['paths']['test_img'])), f"Missing test images. Attach competition dataset."
+    assert os.path.isdir(os.path.join(BASE, cfg['paths']['test_img'])), f"Missing test images."
 
 print(f"Environment: {'Kaggle' if IS_KAGGLE else 'Local'} | Devices: {NUM_DEVICES} | Batch: {GLOBAL_BATCH_SIZE}")
 
-# ============================================================
-# 2. DATASET
-# ============================================================
 class SolarFilamentDataset(Dataset):
     def __init__(self, chunk_dir, augment=False):
         self.chunk_dir = chunk_dir
@@ -90,25 +87,62 @@ class SolarFilamentDataset(Dataset):
         mask = np.load(os.path.join(self.chunk_dir, mask_file), mmap_mode='r').copy()
 
         if self.augment:
+            # 1. RANDOM RESIZED CROP
+            if np.random.rand() > 0.5:
+                scale = np.random.uniform(0.6, 1.0)
+                crop_size = int(IMG_SIZE * scale)
+                dx = np.random.randint(0, IMG_SIZE - crop_size + 1)
+                dy = np.random.randint(0, IMG_SIZE - crop_size + 1)
+
+                img_crop = img[dy:dy+crop_size, dx:dx+crop_size]
+                mask_crop = mask[dy:dy+crop_size, dx:dx+crop_size]
+
+                img = cv2.resize(img_crop, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+                mask = cv2.resize(mask_crop, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_NEAREST)
+
+            # 2. ROTATION
+            if np.random.rand() > 0.5:
+                angle = np.random.uniform(0, 360)
+                M = cv2.getRotationMatrix2D((IMG_SIZE/2, IMG_SIZE/2), angle, 1.0)
+                img = cv2.warpAffine(img, M, (IMG_SIZE, IMG_SIZE), borderMode=cv2.BORDER_REFLECT)
+                mask = cv2.warpAffine(mask, M, (IMG_SIZE, IMG_SIZE), borderMode=cv2.BORDER_REFLECT)
+
+            # 3. FLIPS
             if np.random.rand() > 0.5: img, mask = np.fliplr(img), np.fliplr(mask)
             if np.random.rand() > 0.5: img, mask = np.flipud(img), np.flipud(mask)
-            if np.random.rand() > 0.5: img, mask = np.rot90(img).copy(), np.rot90(mask).copy()
 
+            # 4. CLAHE
+            if np.random.rand() > 0.5:
+                clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+                img_uint8 = (img * 255).astype(np.uint8)
+                img = clahe.apply(img_uint8).astype(np.float32) / 255.0
+
+            # 5. GAMMA
             if np.random.rand() > 0.5:
                 gamma = np.random.uniform(0.7, 1.3)
                 img = np.clip(img ** gamma, 0, 1)
+
+            # 6. BLUR
+            if np.random.rand() > 0.6:
+                ksize = np.random.choice([3, 5])
+                img = cv2.GaussianBlur(img, (ksize, ksize), 0)
+
+            # 7. NOISE
             if np.random.rand() > 0.5:
                 noise = np.random.randn(*img.shape).astype(np.float32) * 0.05
                 img = np.clip(img + img * noise, 0, 1)
 
-            if np.random.rand() > 0.3:
-                for _ in range(np.random.randint(1, 4)):
-                    drop_size = np.random.randint(16, 48)
-                    dx = np.random.randint(0, IMG_SIZE - drop_size)
-                    dy = np.random.randint(0, IMG_SIZE - drop_size)
-                    img[dy:dy+drop_size, dx:dx+drop_size] = 0.0
-                    mask[dy:dy+drop_size, dx:dx+drop_size] = 0.0
+            # 8. GRIDMASK
+            if np.random.rand() > 0.6:
+                grid_size = np.random.choice([32, 64])
+                mask_ratio = np.random.uniform(0.3, 0.6)
+                for y in range(0, IMG_SIZE, grid_size):
+                    for x in range(0, IMG_SIZE, grid_size):
+                        if np.random.rand() > mask_ratio:
+                            img[y:y+grid_size, x:x+grid_size] = 0.0
+                            mask[y:y+grid_size, x:x+grid_size] = 0.0
 
+            # 9. ELASTIC
             if np.random.rand() > 0.85:
                 alpha = IMG_SIZE * 0.05
                 sigma = IMG_SIZE * 0.05
@@ -121,7 +155,6 @@ class SolarFilamentDataset(Dataset):
                 mask = cv2.remap(mask, x_map, y_map, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
                 mask = (mask > 0.5).astype(np.float32)
 
-        # Fix: Force contiguous array to avoid negative stride errors in PyTorch DataLoader
         img = np.ascontiguousarray(img)
         mask = np.ascontiguousarray(mask)
 
@@ -140,9 +173,6 @@ val_loader = DataLoader(
     num_workers=2, persistent_workers=True, pin_memory=False,
 )
 
-# ============================================================
-# 3. EQUINOX U-NET
-# ============================================================
 class ConvBlock(eqx.Module):
     conv1: eqx.nn.Conv2d
     conv2: eqx.nn.Conv2d
@@ -187,9 +217,6 @@ class UNet(eqx.Module):
         u1 = self.up_conv1(x2_up); x1_up = self.up1(jnp.concatenate([u1, x1], axis=0))
         return self.out_conv(x1_up)
 
-# ============================================================
-# 4. LOSSES & TRAIN STEP
-# ============================================================
 def focal_loss(preds, targets, alpha=0.8, gamma=2.0):
     bce = optax.sigmoid_binary_cross_entropy(preds, targets)
     pt = jnp.exp(-bce)
@@ -235,12 +262,7 @@ def validate(pmodel):
         losses.append(float(eval_step(model_single, x, y)))
     return float(np.mean(losses))
 
-# ============================================================
-# 5. POST-PROCESSING & INFERENCE
-# ============================================================
 def rle_encode(mask):
-    # Fix: Kaggle usually expects Fortran (column-major) order.
-    # If score is 0, change order='F' to order='C'.
     pixels = mask.flatten(order='F')
     pixels = np.concatenate([[0], pixels, [0]])
     runs = np.where(pixels[1:] != pixels[:-1])[0] + 1
@@ -248,17 +270,12 @@ def rle_encode(mask):
     return ' '.join(str(x) for x in runs)
 
 def elite_watershed(binary_mask):
-    # Fix: Ensure no pixels are deleted if a marker is missing
     dist = ndimage.distance_transform_edt(binary_mask)
     local_max = h_maxima(dist, h=1.5)
     markers = ndimage.label(local_max)[0].astype(np.int32)
-
-    # Fill unmarked foreground with connected components
     cc, _ = ndimage.label(binary_mask)
     markers = np.where((markers == 0) & (binary_mask > 0), cc + markers.max() + 1, markers)
-
     labels = watershed(-dist, markers, mask=binary_mask)
-    # Return union to guarantee no data loss
     return ((labels > 0).astype(np.uint8) | binary_mask).astype(np.uint8)
 
 def generate_submission(model):
@@ -324,9 +341,6 @@ def generate_submission(model):
     pd.DataFrame(results).to_csv('submission.csv', index=False)
     print("Submission saved successfully!")
 
-# ============================================================
-# 6. MAIN EXECUTION
-# ============================================================
 if __name__ == "__main__":
     writer = SummaryWriter(LOG_DIR)
 
