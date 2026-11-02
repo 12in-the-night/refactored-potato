@@ -52,8 +52,8 @@ def process_image(args):
             if 'segmentation' in ann and isinstance(ann['segmentation'], list):
                 for seg in ann['segmentation']:
                     poly = np.array(seg).reshape(-1, 2)
-                    if cv2.contourArea(poly.astype(np.int32)) > MIN_FILAMENT_AREA:
-                        cv2.fillPoly(mask, [poly.astype(np.int32)], 1.0)
+                    # FIX: Draw first, check area later
+                    cv2.fillPoly(mask, [poly.astype(np.int32)], 1.0)
 
     out_dir = VAL_DIR if is_val else OUT_DIR
     chunks_saved = 0
@@ -61,7 +61,7 @@ def process_image(args):
     if np.sum(mask) > 0:
         y_coords, x_coords = np.where(mask == 1)
         attempts = 0
-        while chunks_saved < 4 and attempts < 10:
+        while chunks_saved < 4 and attempts < 20:
             attempts += 1
             rand_idx = np.random.randint(0, len(y_coords))
             cy, cx = y_coords[rand_idx], x_coords[rand_idx]
@@ -72,11 +72,13 @@ def process_image(args):
             img_chunk = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
             mask_chunk = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
 
-            if np.sum(mask_chunk) > (MIN_FILAMENT_AREA * 2):
+            # FIX: Filter noise at the chunk level
+            if np.sum(mask_chunk) > MIN_FILAMENT_AREA:
                 np.save(os.path.join(out_dir, f"img_{idx}_{chunks_saved}.npy"), img_chunk)
                 np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask_chunk)
                 chunks_saved += 1
 
+    # Save pure background crop
     neg_saved = False
     neg_attempts = 0
     while not neg_saved and neg_attempts < 15:
@@ -92,7 +94,7 @@ def process_image(args):
             np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask_chunk)
             neg_saved = True
 
-    return 1
+    return chunks_saved
 
 if __name__ == "__main__":
     print(f"Starting Pre-processing with {NUM_WORKERS} CPU workers...")
@@ -108,4 +110,4 @@ if __name__ == "__main__":
         for result in tqdm(executor.map(process_image, tasks), total=len(tasks), desc="Processing Images"):
             total_chunks += result
 
-    print(f"\nSuccess! Generated {total_chunks} chunks.")
+    print(f"\nSuccess! Generated {total_chunks} chunks (Train + Val).")

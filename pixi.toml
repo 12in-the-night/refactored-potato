@@ -2,26 +2,24 @@
 authors = ["jein <darshgupta71@gmail.com>"]
 channels = ["conda-forge"]
 name = "solar"
-platforms = ["win-64"]
+platforms = ["win-64", "linux-64"]
 version = "0.1.0"
 
 [tasks]
 
 [dependencies]
-# Conda packages (these work fine on Windows)
-python = "*"
+python = "3.11.*"
 pyyaml = "*"
 pillow = "*"
 opencv = "*"
 pandas = "*"
-pytorch = "*"
+scipy = "*"
 scikit-image = "*"
-pycocotools = "*"
-maturin ="*"
 tqdm = "*"
 
-[target.win-64.pypi-dependencies]
-# PyPI packages (JAX ecosystem must come from pip on Windows)
+[pypi-dependencies]
 jax = { version = "*", extras = ["cpu"] }
 equinox = "*"
 optax = "*"
+torch = "*"
+tensorboardX = "*"
