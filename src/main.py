@@ -87,7 +87,6 @@ class SolarFilamentDataset(Dataset):
         mask = np.load(os.path.join(self.chunk_dir, mask_file), mmap_mode='r').copy()
 
         if self.augment:
-            # 1. RANDOM RESIZED CROP
             if np.random.rand() > 0.5:
                 scale = np.random.uniform(0.6, 1.0)
                 crop_size = int(IMG_SIZE * scale)
@@ -100,39 +99,32 @@ class SolarFilamentDataset(Dataset):
                 img = cv2.resize(img_crop, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
                 mask = cv2.resize(mask_crop, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_NEAREST)
 
-            # 2. ROTATION
             if np.random.rand() > 0.5:
                 angle = np.random.uniform(0, 360)
                 M = cv2.getRotationMatrix2D((IMG_SIZE/2, IMG_SIZE/2), angle, 1.0)
                 img = cv2.warpAffine(img, M, (IMG_SIZE, IMG_SIZE), borderMode=cv2.BORDER_REFLECT)
                 mask = cv2.warpAffine(mask, M, (IMG_SIZE, IMG_SIZE), borderMode=cv2.BORDER_REFLECT)
 
-            # 3. FLIPS
             if np.random.rand() > 0.5: img, mask = np.fliplr(img), np.fliplr(mask)
             if np.random.rand() > 0.5: img, mask = np.flipud(img), np.flipud(mask)
 
-            # 4. CLAHE
             if np.random.rand() > 0.5:
                 clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
                 img_uint8 = (img * 255).astype(np.uint8)
                 img = clahe.apply(img_uint8).astype(np.float32) / 255.0
 
-            # 5. GAMMA
             if np.random.rand() > 0.5:
                 gamma = np.random.uniform(0.7, 1.3)
                 img = np.clip(img ** gamma, 0, 1)
 
-            # 6. BLUR
             if np.random.rand() > 0.6:
                 ksize = np.random.choice([3, 5])
                 img = cv2.GaussianBlur(img, (ksize, ksize), 0)
 
-            # 7. NOISE
             if np.random.rand() > 0.5:
                 noise = np.random.randn(*img.shape).astype(np.float32) * 0.05
                 img = np.clip(img + img * noise, 0, 1)
 
-            # 8. GRIDMASK
             if np.random.rand() > 0.6:
                 grid_size = np.random.choice([32, 64])
                 mask_ratio = np.random.uniform(0.3, 0.6)
@@ -142,7 +134,6 @@ class SolarFilamentDataset(Dataset):
                             img[y:y+grid_size, x:x+grid_size] = 0.0
                             mask[y:y+grid_size, x:x+grid_size] = 0.0
 
-            # 9. ELASTIC
             if np.random.rand() > 0.85:
                 alpha = IMG_SIZE * 0.05
                 sigma = IMG_SIZE * 0.05
