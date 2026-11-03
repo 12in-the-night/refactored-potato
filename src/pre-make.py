@@ -2,17 +2,17 @@ import os
 import json
 import numpy as np
 import cv2
-from PIL import Image
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
 
 cv2.setNumThreads(0)
 
-LOCAL_BASE = "./data/MAGFiLO_1.0_Kaggle_2026"
+IS_KAGGLE = os.path.exists("/kaggle/input")
+LOCAL_BASE = "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026" if IS_KAGGLE else "./data/MAGFiLO_1.0_Kaggle_2026"
 IMG_DIR = os.path.join(LOCAL_BASE, "train/train_images")
 ANN_FILE = os.path.join(LOCAL_BASE, "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json")
-OUT_DIR = "./data/preprocessed_chunks"
-VAL_DIR = "./data/preprocessed_chunks_val"
+OUT_DIR = "/kaggle/working/preprocessed_chunks" if IS_KAGGLE else "./data/preprocessed_chunks"
+VAL_DIR = "/kaggle/working/preprocessed_chunks_val" if IS_KAGGLE else "./data/preprocessed_chunks_val"
 
 IMG_SIZE = 512
 VAL_SPLIT = 0.1
@@ -29,85 +29,78 @@ with open(ANN_FILE, 'r') as f:
 ann_index = {}
 for ann in data['annotations']:
     img_id = ann['image_id']
-    if img_id not in ann_index: ann_index[img_id] = []
-    ann_index[img_id].append(ann)
+    ann_index.setdefault(img_id, []).append(ann)
 
 file_to_id = {img['file_name']: img['id'] for img in data['images']}
 
 def process_image(args):
     idx, fname, is_val = args
-    if not fname.endswith('.jpeg'): return 0
+    if not fname.lower().endswith(('.jpeg', '.jpg', '.png')):
+        return 0
 
     np.random.seed(idx + SEED)
 
-    img_path = os.path.join(IMG_DIR, fname)
-    img = Image.open(img_path).convert('L')
-    img = np.array(img, dtype=np.float32) / 255.0
+    # cv2.imread is significantly faster than PIL
+    img = cv2.imread(os.path.join(IMG_DIR, fname), cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return 0
+    H, W = img.shape
 
-    mask = np.zeros((2048, 2048), dtype=np.float32)
+    mask = np.zeros((H, W), dtype=np.uint8)
     img_id = file_to_id.get(fname)
-
     if img_id in ann_index:
         for ann in ann_index[img_id]:
             if 'segmentation' in ann and isinstance(ann['segmentation'], list):
                 for seg in ann['segmentation']:
-                    poly = np.array(seg).reshape(-1, 2)
-                    # FIX: Draw first, check area later
-                    cv2.fillPoly(mask, [poly.astype(np.int32)], 1.0)
+                    poly = np.array(seg, dtype=np.float32).reshape(-1, 2)
+                    cv2.fillPoly(mask, [poly.astype(np.int32)], 1)
 
     out_dir = VAL_DIR if is_val else OUT_DIR
-    chunks_saved = 0
+    saved = 0
+    y_coords, x_coords = np.where(mask == 1)
 
-    if np.sum(mask) > 0:
-        y_coords, x_coords = np.where(mask == 1)
+    if len(y_coords) > 0 and H >= IMG_SIZE and W >= IMG_SIZE:
         attempts = 0
-        while chunks_saved < 4 and attempts < 20:
+        while saved < 4 and attempts < 20:
             attempts += 1
-            rand_idx = np.random.randint(0, len(y_coords))
-            cy, cx = y_coords[rand_idx], x_coords[rand_idx]
+            r = np.random.randint(0, len(y_coords))
+            cy, cx = y_coords[r], x_coords[r]
+            x = int(np.clip(cx - IMG_SIZE // 2, 0, W - IMG_SIZE))
+            y = int(np.clip(cy - IMG_SIZE // 2, 0, H - IMG_SIZE))
 
-            x = np.clip(cx - IMG_SIZE//2, 0, 2048 - IMG_SIZE)
-            y = np.clip(cy - IMG_SIZE//2, 0, 2048 - IMG_SIZE)
+            ic = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
+            mc = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
 
-            img_chunk = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
-            mask_chunk = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
+            if int(mc.sum()) > MIN_FILAMENT_AREA:
+                np.save(os.path.join(out_dir, f"img_{idx}_{saved}.npy"), ic)
+                np.save(os.path.join(out_dir, f"mask_{idx}_{saved}.npy"), mc)
+                saved += 1
 
-            # FIX: Filter noise at the chunk level
-            if np.sum(mask_chunk) > MIN_FILAMENT_AREA:
-                np.save(os.path.join(out_dir, f"img_{idx}_{chunks_saved}.npy"), img_chunk)
-                np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask_chunk)
-                chunks_saved += 1
-
-    # Save pure background crop
     neg_saved = False
     neg_attempts = 0
-    while not neg_saved and neg_attempts < 15:
-        neg_attempts += 1
-        x = np.random.randint(0, 2048 - IMG_SIZE)
-        y = np.random.randint(0, 2048 - IMG_SIZE)
+    if H >= IMG_SIZE and W >= IMG_SIZE:
+        while not neg_saved and neg_attempts < 15:
+            neg_attempts += 1
+            x = np.random.randint(0, W - IMG_SIZE + 1)
+            y = np.random.randint(0, H - IMG_SIZE + 1)
+            ic = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
+            mc = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
+            if int(mc.sum()) == 0:
+                np.save(os.path.join(out_dir, f"img_{idx}_{saved}.npy"), ic)
+                np.save(os.path.join(out_dir, f"mask_{idx}_{saved}.npy"), mc)
+                neg_saved = True
 
-        img_chunk = img[y:y+IMG_SIZE, x:x+IMG_SIZE]
-        mask_chunk = mask[y:y+IMG_SIZE, x:x+IMG_SIZE]
-
-        if np.sum(mask_chunk) == 0:
-            np.save(os.path.join(out_dir, f"img_{idx}_{chunks_saved}.npy"), img_chunk)
-            np.save(os.path.join(out_dir, f"mask_{idx}_{chunks_saved}.npy"), mask_chunk)
-            neg_saved = True
-
-    return chunks_saved
+    return saved + (1 if neg_saved else 0)
 
 if __name__ == "__main__":
-    print(f"Starting Pre-processing with {NUM_WORKERS} CPU workers...")
-    all_files = sorted([f for f in os.listdir(IMG_DIR) if f.endswith('.jpeg')])
-
+    print(f"Workers: {NUM_WORKERS}")
+    all_files = sorted([f for f in os.listdir(IMG_DIR) if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
     np.random.seed(SEED)
-    val_indices = set(np.random.choice(len(all_files), int(len(all_files) * VAL_SPLIT), replace=False))
+    val_idx = set(np.random.choice(len(all_files), int(len(all_files) * VAL_SPLIT), replace=False).tolist())
+    tasks = [(i, f, i in val_idx) for i, f in enumerate(all_files)]
 
-    tasks = [(i, f, i in val_indices) for i, f in enumerate(all_files)]
-
-    total_chunks = 0
-    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
-        for result in tqdm(executor.map(process_image, tasks), total=len(tasks), desc="Processing Images"):
-            total_chunks += result
-
-    print(f"\nSuccess! Generated {total_chunks} chunks (Train + Val).")
+    total = 0
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as ex:
+        for r in tqdm(ex.map(process_image, tasks, chunksize=16), total=len(tasks)):
+            total += r
+    print(f"\nDone. {total} chunks.")
