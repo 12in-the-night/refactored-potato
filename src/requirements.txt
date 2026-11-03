@@ -1,13 +1,19 @@
+# Python dependencies for Solar Filament Segmentation
+# Core ML libraries
 jax[tpu]
 equinox
 optax
 pyyaml
+# Image processing
 Pillow
 opencv-python
+# Data handling
 pandas
 scipy
 scikit-image
+# Logging and visualization
 tensorboardX
+# Additional dependencies
 torch
 tqdm
 pycocotools

@@ -1,27 +1,37 @@
+# Configuration file for Solar Filament Segmentation
+# Contains paths and hyperparameters for training and inference
+
 paths:
+  # Kaggle environment paths
   kaggle_base: "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026"
   kaggle_chunks: "/kaggle/input/solar-flarosome/preprocessed_chunks"
   kaggle_chunks_val: "/kaggle/input/solar-flarosome/preprocessed_chunks_val"
+  # Local environment paths
   local_base: "./data/MAGFiLO_1.0_Kaggle_2026"
   local_chunks: "./data/preprocessed_chunks"
   local_chunks_val: "./data/preprocessed_chunks_val"
+  # Dataset subdirectories
   train_img: "train/train_images"
   ann_file: "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json"
   test_img: "test/test_images"
 
 hyperparameters:
+  # Model architecture
   img_size: 512
   base_channels: 64
+  # Training parameters
   per_device_batch: 16
   epochs: 30
   learning_rate: 0.0005
   seed: 13
   ema_decay: 0.999
   warmup_steps: 200
+  # Post-processing parameters
   min_area: 40
   pos_thr: 0.5
   watershed_h: 1.0
   split_area: 3500
+  # Loss weights
   w_focal: 0.2
   w_dice: 0.6
   w_boundary: 0.2

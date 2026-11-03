@@ -1,3 +1,6 @@
+# PIXI configuration file for Solar Filament Segmentation
+# Defines project dependencies, tasks, and Python version
+
 [workspace]
 authors = ["jein <darshgupta71@gmail.com>"]
 channels = ["conda-forge"]

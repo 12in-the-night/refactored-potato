@@ -1,2 +1,4 @@
-# SCM syntax highlighting & preventing 3-way merges
+# Git attributes configuration
+# Specifies how Git should handle file types
+# For YAML files, enable SCM syntax highlighting and prevent 3-way merges
 pixi.lock merge=binary linguist-language=YAML linguist-generated=true -diff

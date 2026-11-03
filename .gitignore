@@ -1,3 +1,6 @@
+# Git ignore file for Solar Filament Segmentation project
+# Ignore local environment and build artifacts
+
 .pixi/
 data/
 *.npy

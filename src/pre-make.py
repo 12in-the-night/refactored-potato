@@ -1,3 +1,6 @@
+# Preprocessing script for solar filament segmentation data
+# This script processes raw images and annotations into preprocessed chunks
+
 import os
 import json
 import numpy as np
@@ -7,6 +10,7 @@ from concurrent.futures import ProcessPoolExecutor
 
 cv2.setNumThreads(0)
 
+# Check if running in Kaggle environment
 IS_KAGGLE = os.path.exists("/kaggle/input")
 LOCAL_BASE = "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026" if IS_KAGGLE else "./data/MAGFiLO_1.0_Kaggle_2026"
 IMG_DIR = os.path.join(LOCAL_BASE, "train/train_images")
