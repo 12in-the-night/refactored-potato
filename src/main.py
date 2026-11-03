@@ -1,5 +1,7 @@
 import os
 
+# Environment setup for JAX and PyTorch
+# Configure hardware acceleration and logging
 if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME") or os.environ.get("COLAB_TPU_ADDR"):
     os.environ["JAX_PLATFORMS"] = "tpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
@@ -10,6 +12,7 @@ else:
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
+# Import required libraries
 import yaml
 import numpy as np
 import jax
@@ -80,7 +83,13 @@ os.makedirs(LOG_DIR, exist_ok=True)
 assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR}."
 assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR}."
 
+
 class SolarFilamentDataset(Dataset):
+    """
+    Solar Filament Dataset class for loading and processing solar filament segmentation data.
+    
+    This dataset loads pre-processed image-mask pairs from NPY files.
+    """
     def __init__(self, chunk_dir):
         self.chunk_dir = chunk_dir
         self.files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
