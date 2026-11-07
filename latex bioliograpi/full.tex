@@ -1,0 +1,121 @@
+\documentclass[conference]{IEEEtran}
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{multirow}
+
+\begin{document}
+
+\title{Panoptic-Quality Solar Filament Segmentation via TPU-Accelerated U-Net}
+
+\author{\IEEEauthorblockN{Your Name}
+\IEEEauthorblockA{\textit{Department of Computer Science} \\
+\textit{Your University}\\
+City, Country \\
+email@domain.com}
+}
+
+\maketitle
+
+\begin{abstract}
+% [AI PROMPT: Write a dense 200-word abstract.
+% Sentence 1: State the problem (automated solar filament segmentation from H-alpha images) and its importance (space weather, CMEs).
+% Sentence 2: State the challenge (Panoptic Quality metric strictly penalizes overlapping instances and fragmentation).
+% Sentence 3: Introduce the solution (4-layer JAX/Equinox U-Net, TPU v3-8 acceleration, bfloat16 precision, composite Dice-Focal-Boundary loss).
+% Sentence 4: Detail the post-processing (8-way TTA, Hann window blending, score-ordered panoptic painting guaranteeing pixel-disjoint masks).
+% Sentence 5: Conclude with the outcome (high Dice score, strict PQ compliance, fully reproducible code).]
+\end{abstract}
+
+\begin{IEEEkeywords}
+Solar Filaments, Panoptic Quality, U-Net, JAX, TPU, Image Segmentation
+\end{IEEEkeywords}
+
+\section{Introduction}
+% [AI PROMPT: Write a 3-paragraph introduction for an IEEE paper.
+% Paragraph 1: Explain solar filaments (dense clouds of solar material suspended by magnetic fields) and why they matter (CMEs, power grid damage).
+% Paragraph 2: Introduce the MAGFiLO dataset and the specific challenges of H-alpha images (thin barbs, background noise, ground-based observatory artifacts).
+% Paragraph 3: Explain the Panoptic Quality (PQ) metric. Emphasize that PQ requires strict pixel-disjoint instance masks, meaning standard semantic segmentation fails. State that our method solves this by combining U-Net with score-ordered panoptic painting.]
+
+\section{Methodology}
+\subsection{Data Preprocessing and Augmentation}
+% [AI PROMPT: Write 2 paragraphs on data handling.
+% Paragraph 1: Detail the preprocessing. 2048x2048 images are chunked into 512x512 windows. Positive chunks are centered on filament pixels, negative chunks are randomly sampled background. Mention saving as uint8 to reduce disk I/O by 75% compared to float32.
+% Paragraph 2: Detail the JAX augmentation. To eliminate the CPU data-loading bottleneck, all augmentations (random flips, 90-degree rotations, gamma correction) are executed asynchronously on the TPU as pure JAX operations.]
+
+\subsection{Network Architecture}
+% [AI PROMPT: Write 2 paragraphs describing the U-Net.
+% Paragraph 1: Describe the 4-layer U-Net architecture implemented in Equinox. Base channels start at 64 and scale to 512 at the bottleneck. Explain that skip connections preserve high-resolution spatial details, which is critical for segmenting thin filament barbs.
+% Paragraph 2: Explain the use of bfloat16 casting for the forward pass to fully saturate TPU tensor cores, and the use of Exponential Moving Average (EMA) with a decay of 0.999 for weight stabilization.]
+% [AI INSTRUCTION: Insert Pipeline Flowchart here]
+% \begin{figure}[htbp]
+% \centerline{\includegraphics[width=\linewidth]{pipeline_flowchart.png}}
+% \caption{End-to-end pipeline: Preprocessing, TPU Training, 8-way TTA Inference, Panoptic Painting, and RLE Generation.}
+% \label{fig:pipeline}
+% \end{figure}
+
+\subsection{Composite Loss Function}
+% [AI PROMPT: Write 1 detailed paragraph explaining the loss function.
+% Explain the weighted composite loss: 0.2 Focal, 0.6 Dice, 0.2 Boundary.
+% Detail WHY this works: Dice directly aligns with the IoU threshold matching used in PQ. Focal loss handles the extreme class imbalance (background vs filament). Boundary loss (using jnp.roll for edge detection) sharpens the mask edges. State the formula: $L = 0.2 L_{focal} + 0.6 L_{dice} + 0.2 L_{boundary}$.]
+
+\section{Inference and Post-Processing}
+\subsection{Sliding Window and TTA}
+% [AI PROMPT: Write 1 paragraph on inference.
+% Explain the sliding window approach (512x512 window, stride 256). Explain the Hann window blending to eliminate seams. Detail the 8-way Test-Time Augmentation (4 rotations, 2 horizontal flips). Emphasize that all 8 views are batched into a single TPU dispatch to avoid XLA overhead.]
+
+\subsection{Strict PQ Compliance via Panoptic Painting}
+% [AI PROMPT: Write a highly technical 2-paragraph section on post-processing.
+% Paragraph 1: Explain thresholding at >0.5, removing components <40 pixels, and using Watershed (h=1.0) to split merged blobs >3500 pixels.
+% Paragraph 2: Explain Score-Ordered Panoptic Painting. The PQ metric rejects overlapping instances (ERROR). To fix this, we sort predicted masks by mean confidence (highest first). Each mask only claims unassigned pixels using the operation `mask & ~claimed`. This mathematically guarantees strict pixel-disjoint instances, ensuring zero PQ errors.]
+
+\section{Results and Evaluation}
+\subsection{Quantitative Results}
+% [AI PROMPT: Write 1 paragraph summarizing the validation metrics. Mention the [INSERT DICE SCORE] and [INSERT PQ SCORE]. Mention that the 8-way TTA and strict panoptic painting eliminated all fragmentation and over-merging penalties.]
+% [AI INSTRUCTION: Insert Table 1 with Hyperparameters]
+% \begin{table}[htbp]
+% \caption{Training Hyperparameters}
+% \begin{center}
+% \begin{tabular}{|l|c|}
+% \hline
+% \textbf{Parameter} & \textbf{Value} \\
+% \hline
+% Image Size & 512 $\times$ 512 \\
+% Batch Size (Global) & 16 $\times$ 8 cores \\
+% Learning Rate & 0.0005 \\
+% Epochs & 30 \\
+% Optimizer & Adam (Warmup Cosine) \\
+% Loss Weights & 0.2 F, 0.6 D, 0.2 B \\
+% EMA Decay & 0.999 \\
+% \hline
+% \end{tabular}
+% \end{center}
+% \end{table}
+
+\subsection{Qualitative Results}
+% [AI INSTRUCTION: Insert Figure 2 showing a 3-panel image: Input H-alpha, Ground Truth, Predicted Mask. Caption it clearly.]
+% \begin{figure}[htbp]
+% \centerline{\includegraphics[width=\linewidth]{qualitative_results.png}}
+% \caption{Left: H-alpha input. Middle: MAGFiLO Ground Truth. Right: Model prediction (red overlay), demonstrating fine-scale barb preservation.}
+% \label{fig:results}
+% \end{figure}
+
+\section{Code Quality and Reproducibility}
+% [AI PROMPT: Write 1 paragraph addressing the 30% qualitative rubric.
+% State that the entire pipeline is open-source on GitHub. Mention the modularity: `pre-make.py` for data, `main.py` for training, `inference.ipynb` for reproduction. Confirm that exact package versions (`requirements.txt`) and the trained weights (`ema_best.eqx`) are included, allowing the committee to reproduce the CSV submission without retraining.]
+
+\section{Conclusion}
+% [AI PROMPT: Write a strong 1-paragraph conclusion.
+% Summarize how the TPU-accelerated JAX pipeline successfully solved the MAGFiLO challenge. Reiterate that the combination of on-device augmentation, bfloat16 precision, and score-ordered panoptic painting provides a highly robust solution to the strict PQ metric.]
+
+\begin{thebibliography}{00}
+\bibitem{b1} A. Kirillov et al., ``Panoptic Quality,'' in \textit{CVPR}, 2019.
+\bibitem{b2} A. Ahmadzadeh et al., ``MAGFiLO: Manually Annotated GONG Filaments,'' \textit{Scientific Data}, 2024.
+\bibitem{b3} Solar Filament Segmentation Challenge 2026, Kaggle.
+\end{thebibliography}
+
+\end{document}

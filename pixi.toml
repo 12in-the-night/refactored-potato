@@ -2,27 +2,28 @@
 # Defines project dependencies, tasks, and Python version
 
 [workspace]
-authors = ["jein <darshgupta71@gmail.com>"]
-channels = ["conda-forge"]
-name = "solar"
-platforms = ["win-64", "linux-64"]
-version = "0.1.0"
+authors = ["jein <darshgupta71@gmail.com>"]  # Project author
+channels = ["conda-forge"]  # Conda channel for packages
+name = "solar"  # Project name
+platforms = ["win-64", "linux-64"]  # Supported platforms
+version = "0.1.0"  # Project version
 
 [tasks]
+# Custom tasks can be defined here (e.g., pixi run train)
 
 [dependencies]
-python = "3.11.*"
-pyyaml = "*"
-pillow = "*"
-opencv = "*"
-pandas = "*"
-scipy = "*"
-scikit-image = "*"
-tqdm = "*"
+python = "3.11.*"  # Python version
+pyyaml = "*"  # YAML parsing
+pillow = "*"  # Image I/O
+opencv = "*"  # Computer vision
+pandas = "*"  # Data manipulation
+scipy = "*"  # Scientific computing
+scikit-image = "*"  # Image processing
+tqdm = "*"  # Progress bars
 
 [pypi-dependencies]
-jax = { version = "*", extras = ["cpu"] }
-equinox = "*"
-optax = "*"
-torch = "*"
-tensorboardX = "*"
+jax = { version = "*", extras = ["cpu"] }  # JAX with CPU extras
+equinox = "*"  # Neural networks for JAX
+optax = "*"  # Optimizers for JAX
+torch = "*"  # PyTorch (for DataLoader)
+tensorboardX = "*"  # TensorBoard logging

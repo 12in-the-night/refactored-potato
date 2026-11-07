@@ -1,10 +1,10 @@
 # Git ignore file for Solar Filament Segmentation project
 # Ignore local environment and build artifacts
 
-.pixi/
-data/
-*.npy
-/out
+.pixi/              # Pixi package manager environment directory
+data/               # Local data directory (large datasets)
+*.npy               # NumPy binary files (preprocessed chunks)
+/out                # Output directory for training artifacts
 
-*.zip
-__pycache__/
+*.zip               # Compressed archive files
+__pycache__/        # Python bytecode cache directories

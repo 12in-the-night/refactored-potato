@@ -3,35 +3,35 @@
 
 paths:
   # Kaggle environment paths
-  kaggle_base: "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026"
-  kaggle_chunks: "/kaggle/input/solar-flarosome/preprocessed_chunks"
-  kaggle_chunks_val: "/kaggle/input/solar-flarosome/preprocessed_chunks_val"
+  kaggle_base: "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026"  # Base dataset path on Kaggle
+  kaggle_chunks: "/kaggle/input/solar-flarosome/preprocessed_chunks"  # Preprocessed training chunks on Kaggle
+  kaggle_chunks_val: "/kaggle/input/solar-flarosome/preprocessed_chunks_val"  # Preprocessed validation chunks on Kaggle
   # Local environment paths
-  local_base: "./data/MAGFiLO_1.0_Kaggle_2026"
-  local_chunks: "./data/preprocessed_chunks"
-  local_chunks_val: "./data/preprocessed_chunks_val"
+  local_base: "./data/MAGFiLO_1.0_Kaggle_2026"  # Base dataset path locally
+  local_chunks: "./data/preprocessed_chunks"  # Preprocessed training chunks locally
+  local_chunks_val: "./data/preprocessed_chunks_val"  # Preprocessed validation chunks locally
   # Dataset subdirectories
-  train_img: "train/train_images"
-  ann_file: "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json"
-  test_img: "test/test_images"
+  train_img: "train/train_images"  # Training images subdirectory
+  ann_file: "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json"  # Training annotations file
+  test_img: "test/test_images"  # Test images subdirectory
 
 hyperparameters:
   # Model architecture
-  img_size: 512
-  base_channels: 64
+  img_size: 512  # Input image size (height/width in pixels)
+  base_channels: 64  # Base number of channels in U-Net encoder
   # Training parameters
-  per_device_batch: 16
-  epochs: 30
-  learning_rate: 0.0005
-  seed: 13
-  ema_decay: 0.999
-  warmup_steps: 200
+  per_device_batch: 16  # Batch size per device (TPU/GPU)
+  epochs: 30  # Number of training epochs
+  learning_rate: 0.0005  # Peak learning rate for cosine decay schedule
+  seed: 13  # Random seed for reproducibility
+  ema_decay: 0.999  # Exponential moving average decay for model weights
+  warmup_steps: 200  # Learning rate warmup steps
   # Post-processing parameters
-  min_area: 40
-  pos_thr: 0.5
-  watershed_h: 1.0
-  split_area: 3500
+  min_area: 40  # Minimum filament area in pixels to keep
+  pos_thr: 0.5  # Probability threshold for positive prediction
+  watershed_h: 1.0  # H-maxima height for watershed segmentation
+  split_area: 3500  # Area threshold for splitting large components
   # Loss weights
-  w_focal: 0.2
-  w_dice: 0.6
-  w_boundary: 0.2
+  w_focal: 0.2  # Weight for focal loss component
+  w_dice: 0.6  # Weight for dice loss component
+  w_boundary: 0.2  # Weight for boundary loss component
