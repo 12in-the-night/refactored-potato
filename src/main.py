@@ -36,12 +36,22 @@ jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 def load_data(chunk_dir):
     files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
-    imgs, masks = [], []
-    for f in tqdm(files, desc=f"Loading {os.path.basename(chunk_dir)}"):
+    n = len(files)
+
+    # Pre-allocate memory to prevent list duplication OOM
+    X = np.empty((n, 512, 512), dtype=np.uint8)
+    Y = np.empty((n, 512, 512), dtype=np.uint8)
+
+    def load_pair(i):
+        f = files[i]
         idx = f.replace('img_', '').replace('.npy', '')
-        imgs.append(np.load(os.path.join(chunk_dir, f)))
-        masks.append(np.load(os.path.join(chunk_dir, f"mask_{idx}.npy")))
-    return np.array(imgs), np.array(masks)
+        X[i] = np.load(os.path.join(chunk_dir, f))
+        Y[i] = np.load(os.path.join(chunk_dir, f"mask_{idx}.npy"))
+
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        list(tqdm(ex.map(load_pair, range(n)), total=n, desc=f"Loading {os.path.basename(chunk_dir)}"))
+
+    return X, Y
 
 def augment_jax(img, mask, key):
     k1, k2, k3, k4 = jax.random.split(key, 4)
