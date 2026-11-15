@@ -71,14 +71,13 @@ def preprocess_train(x, y, keys):
     x = x.astype(jnp.float32) / 255.0
     y = y.astype(jnp.float32)
     x, y = jax.vmap(jax.vmap(augment_jax))(x, y, keys)
-    # Input shape: (Devices, Batch, H, W) -> Output: (Devices, Batch, 1, H, W)
     return jnp.expand_dims(x, 2).astype(jnp.bfloat16), jnp.expand_dims(y, 2).astype(jnp.bfloat16)
 
 @jax.jit
 def preprocess_val(x, y):
     x = x.astype(jnp.float32) / 255.0
     y = y.astype(jnp.float32)
-    # FIXED: Input (Batch, H, W) -> Output (Batch, 1, H, W)
+    # FIXED: Channel dim is axis 1 for (Batch, 1, H, W)
     return jnp.expand_dims(x, 1).astype(jnp.bfloat16), jnp.expand_dims(y, 1).astype(jnp.bfloat16)
 
 class ConvBlock(eqx.Module):
