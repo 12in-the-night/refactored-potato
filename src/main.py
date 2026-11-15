@@ -31,43 +31,6 @@ from tqdm import tqdm
 cv2.setNumThreads(0)
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
-print(f"Devices: {jax.devices()}")
-
-IS_KAGGLE = os.path.exists("/kaggle/input")
-CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-with open(CFG_PATH, "r") as f:
-    cfg = yaml.safe_load(f)
-
-BASE = cfg['paths']['kaggle_base'] if IS_KAGGLE else cfg['paths']['local_base']
-CHUNK_DIR = cfg['paths']['kaggle_chunks'] if IS_KAGGLE else cfg['paths']['local_chunks']
-VAL_DIR = cfg['paths']['kaggle_chunks_val'] if IS_KAGGLE else cfg['paths']['local_chunks_val']
-
-HP = cfg['hyperparameters']
-IMG_SIZE = HP['img_size']
-BASE_CH = HP['base_channels']
-EPOCHS = HP['epochs']
-LR = HP['learning_rate']
-SEED = HP['seed']
-EMA_DECAY = HP['ema_decay']
-WARMUP = HP['warmup_steps']
-MIN_AREA = int(HP['min_area'])
-POS_THR = float(HP['pos_thr'])
-WS_H = float(HP['watershed_h'])
-SPLIT_AREA = int(HP['split_area'])
-W_FOCAL = float(HP['w_focal'])
-W_DICE = float(HP['w_dice'])
-W_BND = float(HP['w_boundary'])
-
-NUM_DEVICES = max(1, jax.local_device_count())
-# Drop batch size to 8 on GPU to avoid OOM
-PER_DEVICE_BATCH = 8 if jax.devices()[0].platform == "gpu" else HP['per_device_batch']
-GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
-
-CHECKPOINT_DIR = "/kaggle/working/checkpoints" if IS_KAGGLE else "./checkpoints"
-LOG_DIR = "/kaggle/working/logs" if IS_KAGGLE else "./tensorboard"
-os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-os.makedirs(LOG_DIR, exist_ok=True)
-
 def load_data(chunk_dir):
     files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
     imgs, masks = [], []
@@ -76,11 +39,6 @@ def load_data(chunk_dir):
         imgs.append(np.load(os.path.join(chunk_dir, f)))
         masks.append(np.load(os.path.join(chunk_dir, f"mask_{idx}.npy")))
     return np.array(imgs), np.array(masks)
-
-print("Loading data to Host RAM...")
-X_train, Y_train = load_data(CHUNK_DIR)
-X_val, Y_val = load_data(VAL_DIR)
-print(f"Train: {X_train.shape}, Val: {X_val.shape}")
 
 def augment_jax(img, mask, key):
     k1, k2, k3, k4 = jax.random.split(key, 4)
@@ -195,11 +153,11 @@ def boundary_loss(preds, targets):
     bce = optax.sigmoid_binary_cross_entropy(preds, targets)
     return jnp.mean(bce * (1.0 + 5.0 * te))
 
-def make_train_step(optimizer, ema_decay):
+def make_train_step(optimizer, ema_decay, w_focal, w_dice, w_bnd):
     def loss_fn(model, x, y):
         model_bf16 = jax.tree_util.tree_map(lambda p: p.astype(jnp.bfloat16) if eqx.is_array(p) else p, model)
         preds = jax.vmap(model_bf16)(x)
-        return W_FOCAL * focal_loss(preds, y) + W_DICE * dice_loss(preds, y) + W_BND * boundary_loss(preds, y)
+        return w_focal * focal_loss(preds, y) + w_dice * dice_loss(preds, y) + w_bnd * boundary_loss(preds, y)
 
     @eqx.filter_pmap(axis_name='batch')
     def train_step(model, ema_model, opt_state, x, y):
@@ -220,24 +178,17 @@ def make_train_step(optimizer, ema_decay):
 def eval_step_bf16(model_bf16, x, y):
     return dice_loss(jax.vmap(model_bf16)(x), y)
 
-def unbroadcast(pmodel):
-    def fn(x):
-        if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES:
-            return x[0]
-        return x
-    return jax.tree_util.tree_map(fn, pmodel)
-
-def watershed_labels(binary_mask):
+def watershed_labels(binary_mask, ws_h):
     dist = ndimage.distance_transform_edt(binary_mask)
-    local_max = h_maxima(dist, h=WS_H)
+    local_max = h_maxima(dist, h=ws_h)
     markers = ndimage.label(local_max)[0].astype(np.int32)
     cc, _ = ndimage.label(binary_mask)
     markers = np.where((markers == 0) & (binary_mask > 0), cc + markers.max() + 1, markers)
     return watershed(-dist, markers, mask=binary_mask).astype(np.int32)
 
-def generate_submission(model):
+def generate_submission(model, base, test_img_rel, img_size, pos_thr, min_area, split_area, ws_h):
     print("Generating submission...")
-    test_dir = os.path.join(BASE, cfg['paths']['test_img'])
+    test_dir = os.path.join(base, test_img_rel)
     exts = ('.jpeg', '.jpg', '.png', '.tif', '.tiff')
     test_files = sorted([f for f in os.listdir(test_dir) if f.lower().endswith(exts)])
     results = []
@@ -248,58 +199,48 @@ def generate_submission(model):
     def predict_batch(m, imgs):
         return jax.nn.sigmoid(jax.vmap(m)(imgs))
 
-    hann = np.hanning(IMG_SIZE)
+    hann = np.hanning(img_size)
     ww = np.maximum(np.outer(hann, hann), 0.01)
     stride = 256
-    window = IMG_SIZE
 
     def tta_predict(batch, N):
         rots = [jnp.rot90(batch, i, axes=(2, 3)) for i in range(4)]
         rots_flip = [jnp.flip(r, axis=3) for r in rots]
         all_views = jnp.concatenate(rots + rots_flip, axis=0)
-
         preds = predict_batch(model_bf16, all_views)
-
         p_rots = preds[:4*N]
         p_flips = preds[4*N:]
-
-        acc = np.zeros((N, 1, window, window), dtype=np.float32)
+        acc = np.zeros((N, 1, img_size, img_size), dtype=np.float32)
         for i in range(4):
             p = p_rots[i*N:(i+1)*N]
-            p = jnp.rot90(p, -i, axes=(2, 3))
-            acc += np.array(p)
-
+            acc += np.array(jnp.rot90(p, -i, axes=(2, 3)))
             p_f = p_flips[i*N:(i+1)*N]
             p_f = jnp.rot90(p_f, -i, axes=(2, 3))
-            p_f = jnp.flip(p_f, axis=3)
-            acc += np.array(p_f)
-
+            acc += np.array(jnp.flip(p_f, axis=3))
         return acc / 8.0
 
     for idx, fname in enumerate(test_files):
         img_id = os.path.splitext(fname)[0]
         full_img = np.array(Image.open(os.path.join(test_dir, fname)).convert('L'), dtype=np.float32) / 255.0
         H, W = full_img.shape
-        pad = max(stride, window)
+        pad = max(stride, img_size)
         padded = cv2.copyMakeBorder(full_img, pad, pad, pad, pad, cv2.BORDER_REFLECT)
         ph, pw = padded.shape
 
-        ys = list(range(0, ph - window + 1, stride))
-        if ys[-1] != ph - window:
-            ys.append(ph - window)
-        xs = list(range(0, pw - window + 1, stride))
-        if xs[-1] != pw - window:
-            xs.append(pw - window)
+        ys = list(range(0, ph - img_size + 1, stride))
+        if ys[-1] != ph - img_size: ys.append(ph - img_size)
+        xs = list(range(0, pw - img_size + 1, stride))
+        if xs[-1] != pw - img_size: xs.append(pw - img_size)
 
         chunks, coords = [], []
         for yy in ys:
             for xx in xs:
-                chunks.append(padded[yy:yy+window, xx:xx+window])
+                chunks.append(padded[yy:yy+img_size, xx:xx+img_size])
                 coords.append((yy, xx))
 
         chunks = np.array(chunks, dtype=np.float32)[:, np.newaxis, :, :]
         preds = []
-        INF_BATCH = 16
+        INF_BATCH = 32
         for i in range(0, len(chunks), INF_BATCH):
             b = jnp.array(chunks[i:i+INF_BATCH], dtype=jnp.bfloat16)
             preds.append(tta_predict(b, len(b)))
@@ -308,29 +249,26 @@ def generate_submission(model):
         full_mask = np.zeros((ph, pw), dtype=np.float32)
         wsum = np.zeros((ph, pw), dtype=np.float32)
         for i, (yy, xx) in enumerate(coords):
-            full_mask[yy:yy+window, xx:xx+window] += preds[i][0] * ww
-            wsum[yy:yy+window, xx:xx+window] += ww
+            full_mask[yy:yy+img_size, xx:xx+img_size] += preds[i][0] * ww
+            wsum[yy:yy+img_size, xx:xx+img_size] += ww
 
         full_mask = full_mask / np.maximum(wsum, 1e-5)
         full_mask = full_mask[pad:pad+H, pad:pad+W]
         score_map = cv2.GaussianBlur(full_mask, (5, 5), 1.0)
-        binary = (score_map > POS_THR).astype(np.uint8)
+        binary = (score_map > pos_thr).astype(np.uint8)
 
         num, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
         candidates = []
         for i in range(1, num):
             area = stats[i, cv2.CC_STAT_AREA]
-            if area < MIN_AREA:
-                continue
+            if area < min_area: continue
             m = (labels == i)
-            if area > SPLIT_AREA:
-                wsl = watershed_labels(m)
+            if area > split_area:
+                wsl = watershed_labels(m, ws_h)
                 for lv in np.unique(wsl):
-                    if lv == 0:
-                        continue
+                    if lv == 0: continue
                     mm = (wsl == lv)
-                    if mm.sum() >= MIN_AREA:
-                        candidates.append((float(score_map[mm].mean()), mm))
+                    if mm.sum() >= min_area: candidates.append((float(score_map[mm].mean()), mm))
             else:
                 candidates.append((float(score_map[m].mean()), m))
 
@@ -339,7 +277,7 @@ def generate_submission(model):
         kept = []
         for sc, mm in candidates:
             d = mm & ~claimed
-            if d.sum() >= MIN_AREA:
+            if d.sum() >= min_area:
                 kept.append(d)
                 claimed |= d
 
@@ -347,14 +285,54 @@ def generate_submission(model):
             rle = maskUtils.encode(np.asfortranarray(mm.astype(np.uint8)))
             results.append({'filament_id': f"{img_id}_{k}", 'segmentation_rle': rle['counts'].decode('utf-8')})
 
-        if idx % 20 == 0:
-            print(f"{idx+1}/{len(test_files)} | {fname} | {len(kept)} inst")
-
-    out_csv = "/kaggle/working/submission.csv" if IS_KAGGLE else "submission.csv"
+    out_csv = "submission.csv"
     pd.DataFrame(results, columns=['filament_id', 'segmentation_rle']).to_csv(out_csv, index=False)
     print(f"Saved {out_csv} | {len(results)} rows")
 
 if __name__ == "__main__":
+    IS_KAGGLE = os.path.exists("/kaggle/input")
+
+    # Try to find config, default to script dir
+    CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+    if not os.path.exists(CFG_PATH):
+        CFG_PATH = "config.yaml"
+
+    with open(CFG_PATH, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    BASE = cfg['paths'].get('kaggle_base' if IS_KAGGLE else 'local_base', "")
+    CHUNK_DIR = cfg['paths'].get('kaggle_chunks' if IS_KAGGLE else 'local_chunks', "")
+    VAL_DIR = cfg['paths'].get('kaggle_chunks_val' if IS_KAGGLE else 'local_chunks_val', "")
+
+    HP = cfg['hyperparameters']
+    IMG_SIZE = HP['img_size']
+    BASE_CH = HP['base_channels']
+    EPOCHS = HP['epochs']
+    LR = HP['learning_rate']
+    SEED = HP['seed']
+    EMA_DECAY = HP['ema_decay']
+    WARMUP = HP['warmup_steps']
+    MIN_AREA = int(HP['min_area'])
+    POS_THR = float(HP['pos_thr'])
+    WS_H = float(HP['watershed_h'])
+    SPLIT_AREA = int(HP['split_area'])
+    W_FOCAL = float(HP['w_focal'])
+    W_DICE = float(HP['w_dice'])
+    W_BND = float(HP['w_boundary'])
+
+    NUM_DEVICES = max(1, jax.local_device_count())
+    PER_DEVICE_BATCH = 8 if jax.devices()[0].platform == "gpu" else HP['per_device_batch']
+    GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
+
+    CHECKPOINT_DIR = "/kaggle/working/checkpoints" if IS_KAGGLE else "./checkpoints"
+    LOG_DIR = "/kaggle/working/logs" if IS_KAGGLE else "./tensorboard"
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    print("Loading data...")
+    X_train, Y_train = load_data(CHUNK_DIR)
+    X_val, Y_val = load_data(VAL_DIR)
+
     writer = SummaryWriter(LOG_DIR)
     key = jax.random.PRNGKey(SEED)
 
@@ -377,25 +355,21 @@ if __name__ == "__main__":
     opt_state = jax.tree_util.tree_map(
         lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape) if eqx.is_array(x) else x, opt_state)
 
-    train_step = make_train_step(optimizer, EMA_DECAY)
+    train_step = make_train_step(optimizer, EMA_DECAY, W_FOCAL, W_DICE, W_BND)
 
     print(f"Epochs {EPOCHS} | steps/epoch {steps_per_epoch} | total {total_steps} | batch {GLOBAL_BATCH_SIZE}")
 
     best_val = float('inf')
     saved_ckpts = []
-    ema_single = unbroadcast(ema_model)
+    ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES else x, ema_model)
     gstep = 0
 
     for epoch in range(EPOCHS):
         ep_loss = 0.0
         idx = np.random.permutation(len(X_train))
 
-        if epoch == 2:
-            jax.profiler.start_trace(os.path.join(LOG_DIR, "profiler"))
-
         for batch_idx in range(steps_per_epoch):
             batch_idx_arr = idx[batch_idx*GLOBAL_BATCH_SIZE : (batch_idx+1)*GLOBAL_BATCH_SIZE]
-
             x_batch = X_train[batch_idx_arr].reshape(NUM_DEVICES, PER_DEVICE_BATCH, IMG_SIZE, IMG_SIZE)
             y_batch = Y_train[batch_idx_arr].reshape(NUM_DEVICES, PER_DEVICE_BATCH, IMG_SIZE, IMG_SIZE)
 
@@ -413,10 +387,7 @@ if __name__ == "__main__":
             if batch_idx % 10 == 0:
                 print(f"Epoch {epoch+1} Batch {batch_idx} Loss {lv:.4f}")
 
-            if epoch == 2 and batch_idx == 5:
-                jax.profiler.stop_trace()
-
-        ema_single = unbroadcast(ema_model)
+        ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES else x, ema_model)
 
         val_losses = []
         for v_idx in range(0, len(X_val), GLOBAL_BATCH_SIZE):
@@ -435,8 +406,7 @@ if __name__ == "__main__":
         saved_ckpts.append(ck)
         if len(saved_ckpts) > 3:
             old = saved_ckpts.pop(0)
-            if os.path.exists(old):
-                os.remove(old)
+            if os.path.exists(old): os.remove(old)
 
         if val_loss < best_val:
             best_val = val_loss
@@ -447,4 +417,4 @@ if __name__ == "__main__":
 
     bp = os.path.join(CHECKPOINT_DIR, "ema_best.eqx")
     best_model = eqx.tree_deserialise_leaves(bp, ema_single) if os.path.exists(bp) else ema_single
-    generate_submission(best_model)
+    generate_submission(best_model, BASE, cfg['paths']['test_img'], IMG_SIZE, POS_THR, MIN_AREA, SPLIT_AREA, WS_H)
