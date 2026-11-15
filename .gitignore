@@ -7,4 +7,6 @@ data/               # Local data directory (large datasets)
 /out                # Output directory for training artifacts
 
 *.zip               # Compressed archive files
-__pycache__/        # Python bytecode cache directories
+__pycache__/        # Python bytecode cache directorie
+src/data/MAGFiLO_1.0_Kaggle_2026/
+src/.ipynb_checkpoints/
