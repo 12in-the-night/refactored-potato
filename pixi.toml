@@ -20,10 +20,3 @@ pandas = "*"  # Data manipulation
 scipy = "*"  # Scientific computing
 scikit-image = "*"  # Image processing
 tqdm = "*"  # Progress bars
-
-[pypi-dependencies]
-jax = { version = "*", extras = ["cpu"] }  # JAX with CPU extras
-equinox = "*"  # Neural networks for JAX
-optax = "*"  # Optimizers for JAX
-torch = "*"  # PyTorch (for DataLoader)
-tensorboardX = "*"  # TensorBoard logging

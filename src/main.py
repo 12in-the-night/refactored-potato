@@ -1,12 +1,10 @@
 import os
 import glob
 import yaml
-import shutil
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
 
-# Auto-detect accelerator before importing JAX
 if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME"):
     os.environ["JAX_PLATFORMS"] = "tpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
@@ -39,16 +37,15 @@ def load_data(chunk_dir):
     n = len(files)
     X = np.empty((n, 512, 512), dtype=np.uint8)
     Y = np.empty((n, 512, 512), dtype=np.uint8)
-
     def load_pair(i):
         f = files[i]
         idx = f.replace('img_', '').replace('.npy', '')
         X[i] = np.load(os.path.join(chunk_dir, f))
         Y[i] = np.load(os.path.join(chunk_dir, f"mask_{idx}.npy"))
-
     with ThreadPoolExecutor(max_workers=32) as ex:
         list(tqdm(ex.map(load_pair, range(n)), total=n, desc=f"Loading {os.path.basename(chunk_dir)}"))
 
+    print(f"Data Check -> X max: {X.max()}, Y unique: {np.unique(Y)}")
     return X, Y
 
 def augment_jax(img, mask, key):
@@ -68,16 +65,14 @@ def augment_jax(img, mask, key):
 
 @jax.jit
 def preprocess_train(x, y, keys):
-    # FIXED: No / 255.0
-    x = x.astype(jnp.float32)
+    x = x.astype(jnp.float32) / 255.0
     y = y.astype(jnp.float32)
     x, y = jax.vmap(jax.vmap(augment_jax))(x, y, keys)
     return jnp.expand_dims(x, 2).astype(jnp.bfloat16), jnp.expand_dims(y, 2).astype(jnp.bfloat16)
 
 @jax.jit
 def preprocess_val(x, y):
-    # FIXED: No / 255.0 and axis 1 for channels
-    x = x.astype(jnp.float32)
+    x = x.astype(jnp.float32) / 255.0
     y = y.astype(jnp.float32)
     return jnp.expand_dims(x, 1).astype(jnp.bfloat16), jnp.expand_dims(y, 1).astype(jnp.bfloat16)
 
@@ -111,7 +106,7 @@ class UNet(eqx.Module):
     up3: ConvBlock
     up4: ConvBlock
     out_conv: eqx.nn.Conv2d
-    def __init__(self, in_channels=1, out_channels=1, base=64, key=jax.random.PRNGKey(0)):
+    def __init__(self, in_channels=1, out_channels=1, base=32, key=jax.random.PRNGKey(0)):
         keys = jax.random.split(key, 15)
         c1, c2, c3, c4 = base, base*2, base*4, base*8
         self.pool = eqx.nn.MaxPool2d(2, 2)
@@ -232,12 +227,7 @@ def generate_submission(model, base, test_img_rel, img_size, pos_thr, min_area, 
 
     for idx, fname in enumerate(test_files):
         img_id = os.path.splitext(fname)[0]
-        full_img = np.array(Image.open(os.path.join(test_dir, fname)).convert('L'), dtype=np.float32)
-
-        # Since train images are [0, 1], test images should also be [0, 1]
-        if full_img.max() > 1.0:
-            full_img = full_img / 255.0
-
+        full_img = np.array(Image.open(os.path.join(test_dir, fname)).convert('L'), dtype=np.float32) / 255.0
         H, W = full_img.shape
         pad = max(stride, img_size)
         padded = cv2.copyMakeBorder(full_img, pad, pad, pad, pad, cv2.BORDER_REFLECT)
@@ -301,33 +291,21 @@ def generate_submission(model, base, test_img_rel, img_size, pos_thr, min_area, 
             rle = maskUtils.encode(np.asfortranarray(mm.astype(np.uint8)))
             results.append({'filament_id': f"{img_id}_{k}", 'segmentation_rle': rle['counts'].decode('utf-8')})
 
-    out_csv = "/kaggle/working/submission.csv"
+    out_csv = "submission.csv"
     pd.DataFrame(results, columns=['filament_id', 'segmentation_rle']).to_csv(out_csv, index=False)
     print(f"Saved {out_csv} | {len(results)} rows")
 
 if __name__ == "__main__":
     IS_KAGGLE = os.path.exists("/kaggle/input")
-
     CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
     if not os.path.exists(CFG_PATH): CFG_PATH = "config.yaml"
     with open(CFG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # Auto-find paths for Kaggle
     if IS_KAGGLE:
         BASE = cfg['paths']['kaggle_base']
-        chunk_search = glob.glob("/kaggle/input/**/preprocessed_chunks", recursive=True)
-        val_search = glob.glob("/kaggle/input/**/preprocessed_chunks_val", recursive=True)
-
-        if chunk_search:
-            CHUNK_DIR = chunk_search[0]
-        else:
-            CHUNK_DIR = cfg['paths']['kaggle_chunks']
-
-        if val_search:
-            VAL_DIR = val_search[0]
-        else:
-            VAL_DIR = cfg['paths']['kaggle_chunks_val']
+        CHUNK_DIR = cfg['paths']['kaggle_chunks']
+        VAL_DIR = cfg['paths']['kaggle_chunks_val']
     else:
         BASE = cfg['paths']['local_base']
         CHUNK_DIR = cfg['paths']['local_chunks']
