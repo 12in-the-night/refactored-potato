@@ -156,7 +156,7 @@ def make_train_step(optimizer):
         return model, opt_state, jax.lax.pmean(loss, axis_name='batch')
     return train_step
 
-# --- 4. POST-PROCESSING ---
+# --- 4. POST-PROCESSING & INFERENCE ---
 def watershed_labels(binary_mask, ws_h=1.0):
     dist = ndimage.distance_transform_edt(binary_mask)
     local_max = h_maxima(dist, h=ws_h)
@@ -224,10 +224,9 @@ if __name__ == "__main__":
     IS_KAGGLE = os.path.exists("/kaggle/input")
 
     if IS_KAGGLE:
-        # Auto-find the JSON file anywhere in /kaggle/input
         ann_search = glob.glob("/kaggle/input/**/MAGFiLO_1.0_Annotations_kaggle2026_train.json", recursive=True)
         if not ann_search:
-            raise FileNotFoundError("Could not find dataset JSON. Ensure competition dataset is added.")
+            raise FileNotFoundError("Could not find dataset JSON.")
         ANN_FILE = ann_search[0]
         BASE = os.path.dirname(os.path.dirname(ANN_FILE))
         IMG_DIR = os.path.join(os.path.dirname(ANN_FILE), "train_images")
@@ -258,8 +257,11 @@ if __name__ == "__main__":
 
     model = UNet(1, 1, base=BASE_CH, key=key)
     opt_state = optimizer.init(eqx.filter(model, eqx.is_array))
-    model = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape), model)
-    opt_state = jax.tree_util.tree_map(lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape), opt_state)
+
+    # FIXED BROADCAST HERE
+    broadcast = lambda x: jnp.broadcast_to(x, (NUM_DEVICES,) + x.shape) if eqx.is_array(x) else x
+    model = jax.tree_util.tree_map(broadcast, model)
+    opt_state = jax.tree_util.tree_map(broadcast, opt_state)
 
     train_step = make_train_step(optimizer)
 
