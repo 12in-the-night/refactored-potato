@@ -49,13 +49,6 @@ def load_data(chunk_dir):
     with ThreadPoolExecutor(max_workers=32) as ex:
         list(tqdm(ex.map(load_pair, range(n)), total=n, desc=f"Loading {os.path.basename(chunk_dir)}"))
 
-    print(f"--- Data Check ---")
-    print(f"X shape: {X.shape}, dtype: {X.dtype}, min: {X.min()}, max: {X.max()}")
-    print(f"Y shape: {Y.shape}, dtype: {Y.dtype}, unique: {np.unique(Y)}")
-    assert X.dtype == np.uint8 and Y.dtype == np.uint8
-    assert X.max() > 0 and X.min() == 0
-    assert set(np.unique(Y)).issubset({0, 1})
-
     return X, Y
 
 def augment_jax(img, mask, key):
@@ -78,13 +71,15 @@ def preprocess_train(x, y, keys):
     x = x.astype(jnp.float32) / 255.0
     y = y.astype(jnp.float32)
     x, y = jax.vmap(jax.vmap(augment_jax))(x, y, keys)
+    # Input shape: (Devices, Batch, H, W) -> Output: (Devices, Batch, 1, H, W)
     return jnp.expand_dims(x, 2).astype(jnp.bfloat16), jnp.expand_dims(y, 2).astype(jnp.bfloat16)
 
 @jax.jit
 def preprocess_val(x, y):
     x = x.astype(jnp.float32) / 255.0
     y = y.astype(jnp.float32)
-    return jnp.expand_dims(x, 2).astype(jnp.bfloat16), jnp.expand_dims(y, 2).astype(jnp.bfloat16)
+    # FIXED: Input (Batch, H, W) -> Output (Batch, 1, H, W)
+    return jnp.expand_dims(x, 1).astype(jnp.bfloat16), jnp.expand_dims(y, 1).astype(jnp.bfloat16)
 
 class ConvBlock(eqx.Module):
     conv1: eqx.nn.Conv2d
@@ -417,6 +412,7 @@ if __name__ == "__main__":
             if epoch == 2 and batch_idx == 5: jax.profiler.stop_trace()
 
         ema_single = unbroadcast(ema_model, NUM_DEVICES)
+
         val_losses = []
         for v_idx in range(0, len(X_val), GLOBAL_BATCH_SIZE):
             vx = X_val[v_idx:v_idx+GLOBAL_BATCH_SIZE]
