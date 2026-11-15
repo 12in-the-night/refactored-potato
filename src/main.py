@@ -1,22 +1,23 @@
 import os
+import glob
+import shutil
+import yaml
+import numpy as np
+from concurrent.futures import ThreadPoolExecutor
+from tqdm import tqdm
 
-# Force CUDA
-os.environ["JAX_PLATFORMS"] = "cuda"
-
-# Grab 95% of the 16GB VRAM on each T4 immediately
-os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
-
-# GPU-specific XLA flags for latency hiding and async streams
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_enable_latency_hiding_scheduler=true "
-    "--xla_gpu_enable_highest_priority_async_stream=true"
-)
+# Auto-detect accelerator before importing JAX
+if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME"):
+    os.environ["JAX_PLATFORMS"] = "tpu"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+elif os.environ.get("COLAB_GPU") or os.path.exists("/proc/driver/nvidia/version"):
+    os.environ["JAX_PLATFORMS"] = "cuda"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+else:
+    os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-import yaml
-import numpy as np
 import jax
 import jax.numpy as jnp
 import equinox as eqx
@@ -29,7 +30,6 @@ from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 from tensorboardX import SummaryWriter
 from pycocotools import mask as maskUtils
-from tqdm import tqdm
 
 cv2.setNumThreads(0)
 jax.config.update("jax_default_matmul_precision", "bfloat16")
@@ -37,8 +37,7 @@ jax.config.update("jax_default_matmul_precision", "bfloat16")
 def load_data(chunk_dir):
     files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
     n = len(files)
-
-    # Pre-allocate memory to prevent list duplication OOM
+    # Pre-allocate exact memory
     X = np.empty((n, 512, 512), dtype=np.uint8)
     Y = np.empty((n, 512, 512), dtype=np.uint8)
 
@@ -48,8 +47,17 @@ def load_data(chunk_dir):
         X[i] = np.load(os.path.join(chunk_dir, f))
         Y[i] = np.load(os.path.join(chunk_dir, f"mask_{idx}.npy"))
 
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    with ThreadPoolExecutor(max_workers=32) as ex:
         list(tqdm(ex.map(load_pair, range(n)), total=n, desc=f"Loading {os.path.basename(chunk_dir)}"))
+
+    # Data Validation
+    print(f"--- Data Check for {os.path.basename(chunk_dir)} ---")
+    print(f"X shape: {X.shape}, dtype: {X.dtype}, min: {X.min()}, max: {X.max()}")
+    print(f"Y shape: {Y.shape}, dtype: {Y.dtype}, unique values: {np.unique(Y)}")
+    assert X.dtype == np.uint8 and Y.dtype == np.uint8, "Data must be uint8"
+    assert X.max() > 0 and X.min() == 0, "Image data range invalid"
+    assert set(np.unique(Y)).issubset({0, 1}), "Mask must be binary"
+    print("Data passed validation.")
 
     return X, Y
 
@@ -86,14 +94,12 @@ class ConvBlock(eqx.Module):
     conv2: eqx.nn.Conv2d
     norm1: eqx.nn.GroupNorm
     norm2: eqx.nn.GroupNorm
-
     def __init__(self, in_ch, out_ch, key):
         k1, k2 = jax.random.split(key, 2)
         self.conv1 = eqx.nn.Conv2d(in_ch, out_ch, 3, padding=1, key=k1)
         self.conv2 = eqx.nn.Conv2d(out_ch, out_ch, 3, padding=1, key=k2)
         self.norm1 = eqx.nn.GroupNorm(min(8, out_ch), out_ch)
         self.norm2 = eqx.nn.GroupNorm(min(8, out_ch), out_ch)
-
     def __call__(self, x):
         x = jax.nn.relu(self.norm1(self.conv1(x)))
         return jax.nn.relu(self.norm2(self.conv2(x)))
@@ -113,7 +119,6 @@ class UNet(eqx.Module):
     up3: ConvBlock
     up4: ConvBlock
     out_conv: eqx.nn.Conv2d
-
     def __init__(self, in_channels=1, out_channels=1, base=64, key=jax.random.PRNGKey(0)):
         keys = jax.random.split(key, 15)
         c1, c2, c3, c4 = base, base*2, base*4, base*8
@@ -122,7 +127,6 @@ class UNet(eqx.Module):
         self.down2 = ConvBlock(c1, c2, keys[1])
         self.down3 = ConvBlock(c2, c3, keys[2])
         self.down4 = ConvBlock(c3, c4, keys[3])
-
         self.up_conv4 = eqx.nn.ConvTranspose2d(c4, c3, 2, 2, key=keys[4])
         self.up4 = ConvBlock(c4 + c3, c3, keys[5])
         self.up_conv3 = eqx.nn.ConvTranspose2d(c3, c2, 2, 2, key=keys[6])
@@ -132,13 +136,11 @@ class UNet(eqx.Module):
         self.up_conv1 = eqx.nn.ConvTranspose2d(c1, c1//2, 2, 2, key=keys[10])
         self.up1 = ConvBlock(c1//2 + c1, c1//2, keys[11])
         self.out_conv = eqx.nn.Conv2d(c1//2, out_channels, 1, key=keys[12])
-
     def __call__(self, x):
         x1 = self.down1(x); p1 = self.pool(x1)
         x2 = self.down2(p1); p2 = self.pool(x2)
         x3 = self.down3(p2); p3 = self.pool(x3)
         x4 = self.down4(p3); p4 = self.pool(x4)
-
         u4 = self.up_conv4(p4)
         x4u = self.up4(jnp.concatenate([u4, x4], axis=0))
         u3 = self.up_conv3(x4u)
@@ -178,11 +180,8 @@ def make_train_step(optimizer, ema_decay, w_focal, w_dice, w_bnd):
         grads = jax.tree_util.tree_map(lambda g: jax.lax.pmean(g, axis_name='batch'), grads)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
         model = eqx.apply_updates(model, updates)
-
         ema_model = jax.tree_util.tree_map(
-            lambda e, m: ema_decay * e + (1.0 - ema_decay) * m if (eqx.is_array(e) and eqx.is_array(m)) else m,
-            ema_model, model
-        )
+            lambda e, m: ema_decay * e + (1.0 - ema_decay) * m if (eqx.is_array(e) and eqx.is_array(m)) else m, ema_model, model)
         return model, ema_model, opt_state, jax.lax.pmean(loss, axis_name='batch')
 
     return train_step
@@ -190,6 +189,13 @@ def make_train_step(optimizer, ema_decay, w_focal, w_dice, w_bnd):
 @eqx.filter_jit
 def eval_step_bf16(model_bf16, x, y):
     return dice_loss(jax.vmap(model_bf16)(x), y)
+
+def unbroadcast(pmodel, num_devices):
+    def fn(x):
+        if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == num_devices:
+            return x[0]
+        return x
+    return jax.tree_util.tree_map(fn, pmodel)
 
 def watershed_labels(binary_mask, ws_h):
     dist = ndimage.distance_transform_edt(binary_mask)
@@ -305,17 +311,25 @@ def generate_submission(model, base, test_img_rel, img_size, pos_thr, min_area, 
 if __name__ == "__main__":
     IS_KAGGLE = os.path.exists("/kaggle/input")
 
-    # Try to find config, default to script dir
     CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
-    if not os.path.exists(CFG_PATH):
-        CFG_PATH = "config.yaml"
-
+    if not os.path.exists(CFG_PATH): CFG_PATH = "config.yaml"
     with open(CFG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
-    BASE = cfg['paths'].get('kaggle_base' if IS_KAGGLE else 'local_base', "")
-    CHUNK_DIR = cfg['paths'].get('kaggle_chunks' if IS_KAGGLE else 'local_chunks', "")
-    VAL_DIR = cfg['paths'].get('kaggle_chunks_val' if IS_KAGGLE else 'local_chunks_val', "")
+    # Fast SSD Copy for Kaggle
+    if IS_KAGGLE and not os.path.exists("/kaggle/working/data"):
+        print("Copying to local SSD...")
+        src_dir = os.path.dirname(cfg['paths']['kaggle_chunks'])
+        try:
+            shutil.copytree(src_dir, "/kaggle/working/data")
+            cfg['paths']['kaggle_chunks'] = "/kaggle/working/data/preprocessed_chunks"
+            cfg['paths']['kaggle_chunks_val'] = "/kaggle/working/data/preprocessed_chunks_val"
+        except Exception as e:
+            print(f"Copy failed: {e}. Using network path.")
+
+    BASE = cfg['paths']['kaggle_base'] if IS_KAGGLE else cfg['paths']['local_base']
+    CHUNK_DIR = cfg['paths']['kaggle_chunks'] if IS_KAGGLE else cfg['paths']['local_chunks']
+    VAL_DIR = cfg['paths']['kaggle_chunks_val'] if IS_KAGGLE else cfg['paths']['local_chunks_val']
 
     HP = cfg['hyperparameters']
     IMG_SIZE = HP['img_size']
@@ -353,8 +367,7 @@ if __name__ == "__main__":
     total_steps = max(1, steps_per_epoch * EPOCHS)
 
     schedule = optax.warmup_cosine_decay_schedule(
-        init_value=0.0, peak_value=LR,
-        warmup_steps=min(WARMUP, total_steps // 10),
+        init_value=0.0, peak_value=LR, warmup_steps=min(WARMUP, total_steps // 10),
         decay_steps=total_steps, end_value=1e-5,
     )
     optimizer = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(schedule))
@@ -374,12 +387,14 @@ if __name__ == "__main__":
 
     best_val = float('inf')
     saved_ckpts = []
-    ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES else x, ema_model)
+    ema_single = unbroadcast(ema_model, NUM_DEVICES)
     gstep = 0
 
     for epoch in range(EPOCHS):
         ep_loss = 0.0
         idx = np.random.permutation(len(X_train))
+
+        if epoch == 2: jax.profiler.start_trace(os.path.join(LOG_DIR, "profiler"))
 
         for batch_idx in range(steps_per_epoch):
             batch_idx_arr = idx[batch_idx*GLOBAL_BATCH_SIZE : (batch_idx+1)*GLOBAL_BATCH_SIZE]
@@ -396,12 +411,10 @@ if __name__ == "__main__":
             ep_loss += lv
             writer.add_scalar('Loss/train_batch', lv, gstep)
             gstep += 1
+            if batch_idx % 10 == 0: print(f"Epoch {epoch+1} Batch {batch_idx} Loss {lv:.4f}")
+            if epoch == 2 and batch_idx == 5: jax.profiler.stop_trace()
 
-            if batch_idx % 10 == 0:
-                print(f"Epoch {epoch+1} Batch {batch_idx} Loss {lv:.4f}")
-
-        ema_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 and x.shape[0] == NUM_DEVICES else x, ema_model)
-
+        ema_single = unbroadcast(ema_model, NUM_DEVICES)
         val_losses = []
         for v_idx in range(0, len(X_val), GLOBAL_BATCH_SIZE):
             vx = X_val[v_idx:v_idx+GLOBAL_BATCH_SIZE]
