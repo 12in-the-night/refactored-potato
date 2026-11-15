@@ -1,14 +1,17 @@
 import os
 
-# Auto-detect accelerator before importing JAX
-if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME"):
-    os.environ["JAX_PLATFORMS"] = "tpu"
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-elif os.environ.get("COLAB_GPU") or os.path.exists("/proc/driver/nvidia/version"):
-    os.environ["JAX_PLATFORMS"] = "cuda"
-    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-else:
-    os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# Force CUDA
+os.environ["JAX_PLATFORMS"] = "cuda"
+
+# Grab 95% of the 16GB VRAM on each T4 immediately
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.95"
+
+# GPU-specific XLA flags for latency hiding and async streams
+os.environ["XLA_FLAGS"] = (
+    "--xla_gpu_enable_latency_hiding_scheduler=true "
+    "--xla_gpu_enable_highest_priority_async_stream=true"
+)
 
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 

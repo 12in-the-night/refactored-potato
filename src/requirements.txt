@@ -1,19 +1,13 @@
-# Python dependencies for Solar Filament Segmentation
-# Core ML libraries
-jax[tpu]          # JAX with TPU support for accelerated computing
-equinox           # Neural network library for JAX
-optax             # Gradient processing and optimization for JAX
-pyyaml            # YAML parsing for configuration files
-# Image processing
-Pillow            # Python Imaging Library for image I/O
-opencv-python     # OpenCV for computer vision operations
-# Data handling
-pandas            # Data manipulation and CSV I/O
-scipy             # Scientific computing (ndimage, signal processing)
-scikit-image      # Image processing algorithms (watershed, morphology)
-# Logging and visualization
-tensorboardX      # TensorBoard logging for PyTorch/JAX
-# Additional dependencies
-torch             # PyTorch (used for DataLoader only)
-tqdm              # Progress bars
-pycocotools       # COCO API for RLE encoding/decoding
+jax[tpu]
+equinox
+optax
+pyyaml
+Pillow
+opencv-python
+pandas
+scipy
+scikit-image
+tensorboardX
+torch
+tqdm
+pycocotools
