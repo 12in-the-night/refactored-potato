@@ -1,7 +1,7 @@
 import os
 import glob
-import shutil
 import yaml
+import shutil
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from tqdm import tqdm
@@ -37,7 +37,6 @@ jax.config.update("jax_default_matmul_precision", "bfloat16")
 def load_data(chunk_dir):
     files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
     n = len(files)
-    # Pre-allocate exact memory
     X = np.empty((n, 512, 512), dtype=np.uint8)
     Y = np.empty((n, 512, 512), dtype=np.uint8)
 
@@ -50,14 +49,12 @@ def load_data(chunk_dir):
     with ThreadPoolExecutor(max_workers=32) as ex:
         list(tqdm(ex.map(load_pair, range(n)), total=n, desc=f"Loading {os.path.basename(chunk_dir)}"))
 
-    # Data Validation
-    print(f"--- Data Check for {os.path.basename(chunk_dir)} ---")
+    print(f"--- Data Check ---")
     print(f"X shape: {X.shape}, dtype: {X.dtype}, min: {X.min()}, max: {X.max()}")
-    print(f"Y shape: {Y.shape}, dtype: {Y.dtype}, unique values: {np.unique(Y)}")
-    assert X.dtype == np.uint8 and Y.dtype == np.uint8, "Data must be uint8"
-    assert X.max() > 0 and X.min() == 0, "Image data range invalid"
-    assert set(np.unique(Y)).issubset({0, 1}), "Mask must be binary"
-    print("Data passed validation.")
+    print(f"Y shape: {Y.shape}, dtype: {Y.dtype}, unique: {np.unique(Y)}")
+    assert X.dtype == np.uint8 and Y.dtype == np.uint8
+    assert X.max() > 0 and X.min() == 0
+    assert set(np.unique(Y)).issubset({0, 1})
 
     return X, Y
 
@@ -316,20 +313,25 @@ if __name__ == "__main__":
     with open(CFG_PATH, "r") as f:
         cfg = yaml.safe_load(f)
 
-    # Fast SSD Copy for Kaggle
-    if IS_KAGGLE and not os.path.exists("/kaggle/working/data"):
-        print("Copying to local SSD...")
-        src_dir = os.path.dirname(cfg['paths']['kaggle_chunks'])
-        try:
-            shutil.copytree(src_dir, "/kaggle/working/data")
-            cfg['paths']['kaggle_chunks'] = "/kaggle/working/data/preprocessed_chunks"
-            cfg['paths']['kaggle_chunks_val'] = "/kaggle/working/data/preprocessed_chunks_val"
-        except Exception as e:
-            print(f"Copy failed: {e}. Using network path.")
+    # Auto-find paths for Kaggle
+    if IS_KAGGLE:
+        BASE = cfg['paths']['kaggle_base']
+        chunk_search = glob.glob("/kaggle/input/**/preprocessed_chunks", recursive=True)
+        val_search = glob.glob("/kaggle/input/**/preprocessed_chunks_val", recursive=True)
 
-    BASE = cfg['paths']['kaggle_base'] if IS_KAGGLE else cfg['paths']['local_base']
-    CHUNK_DIR = cfg['paths']['kaggle_chunks'] if IS_KAGGLE else cfg['paths']['local_chunks']
-    VAL_DIR = cfg['paths']['kaggle_chunks_val'] if IS_KAGGLE else cfg['paths']['local_chunks_val']
+        if chunk_search:
+            CHUNK_DIR = chunk_search[0]
+        else:
+            CHUNK_DIR = cfg['paths']['kaggle_chunks']
+
+        if val_search:
+            VAL_DIR = val_search[0]
+        else:
+            VAL_DIR = cfg['paths']['kaggle_chunks_val']
+    else:
+        BASE = cfg['paths']['local_base']
+        CHUNK_DIR = cfg['paths']['local_chunks']
+        VAL_DIR = cfg['paths']['local_chunks_val']
 
     HP = cfg['hyperparameters']
     IMG_SIZE = HP['img_size']
