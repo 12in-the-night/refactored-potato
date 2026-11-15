@@ -1,13 +1,14 @@
 import os
+import glob
 import json
 import numpy as np
 import cv2
 import pandas as pd
-from PIL import Image
 from scipy import ndimage
 from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 from pycocotools import mask as maskUtils
+from tqdm import tqdm
 
 import torch
 from torch.utils.data import Dataset, DataLoader
@@ -20,7 +21,7 @@ import optax
 cv2.setNumThreads(0)
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
-# --- 1. DATASET (ON-THE-FLY) ---
+# --- 1. DATASET ---
 class SolarDataset(Dataset):
     def __init__(self, img_dir, ann_file, img_size=512):
         self.img_dir = img_dir
@@ -164,7 +165,7 @@ def watershed_labels(binary_mask, ws_h=1.0):
     markers = np.where((markers == 0) & (binary_mask > 0), cc + markers.max() + 1, markers)
     return watershed(-dist, markers, mask=binary_mask).astype(np.int32)
 
-def generate_submission(model, test_dir, img_size=512):
+def generate_submission(model, test_dir, out_csv, img_size=512):
     test_files = sorted([f for f in os.listdir(test_dir) if f.lower().endswith(('.jpeg', '.jpg', '.png'))])
     results = []
     model_bf16 = jax.tree_util.tree_map(lambda p: p.astype(jnp.bfloat16) if eqx.is_array(p) else p, model)
@@ -173,20 +174,16 @@ def generate_submission(model, test_dir, img_size=512):
     def predict_batch(m, imgs):
         return jax.nn.sigmoid(jax.vmap(m)(imgs))
 
-    for idx, fname in enumerate(test_files):
+    print("Generating submission...")
+    for idx, fname in enumerate(tqdm(test_files)):
         img_id = os.path.splitext(fname)[0]
-
         img_orig = cv2.imread(os.path.join(test_dir, fname), cv2.IMREAD_GRAYSCALE)
         H, W = img_orig.shape
-
-        # Resize to 512 for inference to keep it fast and fit model
         img = cv2.resize(img_orig, (img_size, img_size))
         img = img.astype(np.float32) / 255.0
-
         inp = jnp.array(img[None, None, ...], dtype=jnp.bfloat16)
         pred = np.array(predict_batch(model_bf16, inp))[0, 0]
 
-        # Resize mask back to original size
         pred_mask = cv2.resize(pred, (W, H), interpolation=cv2.INTER_LINEAR)
         score_map = cv2.GaussianBlur(pred_mask, (5, 5), 1.0)
         binary = (score_map > 0.5).astype(np.uint8)
@@ -219,20 +216,29 @@ def generate_submission(model, test_dir, img_size=512):
             rle = maskUtils.encode(np.asfortranarray(mm.astype(np.uint8)))
             results.append({'filament_id': f"{img_id}_{k}", 'segmentation_rle': rle['counts'].decode('utf-8')})
 
-    pd.DataFrame(results, columns=['filament_id', 'segmentation_rle']).to_csv("submission.csv", index=False)
-    print("Saved submission.csv")
+    pd.DataFrame(results, columns=['filament_id', 'segmentation_rle']).to_csv(out_csv, index=False)
+    print(f"Saved {out_csv}")
 
 # --- 5. MAIN ---
 if __name__ == "__main__":
     IS_KAGGLE = os.path.exists("/kaggle/input")
+
     if IS_KAGGLE:
-        BASE = "/kaggle/input/filament-segmentation-2026/MAGFiLO_1.0_Kaggle_2026"
+        # Auto-find the JSON file anywhere in /kaggle/input
+        ann_search = glob.glob("/kaggle/input/**/MAGFiLO_1.0_Annotations_kaggle2026_train.json", recursive=True)
+        if not ann_search:
+            raise FileNotFoundError("Could not find dataset JSON. Ensure competition dataset is added.")
+        ANN_FILE = ann_search[0]
+        BASE = os.path.dirname(os.path.dirname(ANN_FILE))
+        IMG_DIR = os.path.join(os.path.dirname(ANN_FILE), "train_images")
+        TEST_DIR = os.path.join(BASE, "test/test_images")
     else:
         BASE = "./data/MAGFiLO_1.0_Kaggle_2026"
+        ANN_FILE = os.path.join(BASE, "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json")
+        IMG_DIR = os.path.join(BASE, "train/train_images")
+        TEST_DIR = os.path.join(BASE, "test/test_images")
 
-    IMG_DIR = os.path.join(BASE, "train/train_images")
-    ANN_FILE = os.path.join(BASE, "train/MAGFiLO_1.0_Annotations_kaggle2026_train.json")
-    TEST_DIR = os.path.join(BASE, "test/test_images")
+    print(f"Dataset found at: {BASE}")
 
     IMG_SIZE = 512
     BATCH_SIZE = 16
@@ -263,15 +269,16 @@ if __name__ == "__main__":
         for imgs, masks in dataloader:
             x = jnp.array(imgs.numpy()).reshape(NUM_DEVICES, BATCH_SIZE, 1, IMG_SIZE, IMG_SIZE)
             y = jnp.array(masks.numpy()).reshape(NUM_DEVICES, BATCH_SIZE, 1, IMG_SIZE, IMG_SIZE)
-
             model, opt_state, loss = train_step(model, opt_state, x, y)
             ep_loss += float(jnp.mean(loss))
-
         print(f"Epoch {epoch+1} Loss: {ep_loss/len(dataloader):.4f}")
 
     model_single = jax.tree_util.tree_map(lambda x: x[0] if eqx.is_array(x) and x.ndim > 0 else x, model)
-    eqx.tree_serialise_leaves("ema_best.eqx", model_single)
-    print("Model saved to ema_best.eqx")
 
-    print("Generating submission...")
-    generate_submission(model_single, TEST_DIR, IMG_SIZE)
+    out_weights = "/kaggle/working/ema_best.eqx" if IS_KAGGLE else "ema_best.eqx"
+    out_csv = "/kaggle/working/submission.csv" if IS_KAGGLE else "submission.csv"
+
+    eqx.tree_serialise_leaves(out_weights, model_single)
+    print(f"Model saved to {out_weights}")
+
+    generate_submission(model_single, TEST_DIR, out_csv, IMG_SIZE)
