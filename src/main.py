@@ -1,9 +1,12 @@
 import os
 
-if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME") or os.environ.get("COLAB_TPU_ADDR"):
+# Auto-detect accelerator before importing JAX
+if os.path.exists("/dev/accel0") or os.environ.get("TPU_NAME"):
     os.environ["JAX_PLATFORMS"] = "tpu"
     os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
-    os.environ["XLA_FLAGS"] = "--xla_tpu_spmd_rng_bit_generator_unsafe=true --xla_tpu_enable_data_parallel_all_reduce_opt=true"
+elif os.environ.get("COLAB_GPU") or os.path.exists("/proc/driver/nvidia/version"):
+    os.environ["JAX_PLATFORMS"] = "cuda"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "true"
 else:
     os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
@@ -16,7 +19,6 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
 import cv2
 import pandas as pd
 from scipy import ndimage
@@ -24,37 +26,25 @@ from skimage.morphology import h_maxima
 from skimage.segmentation import watershed
 from tensorboardX import SummaryWriter
 from pycocotools import mask as maskUtils
+from tqdm import tqdm
 
 cv2.setNumThreads(0)
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
-devices = []
-try:
-    devices = jax.devices()
-    is_accel = devices[0].platform in ("tpu", "gpu")
-except Exception:
-    is_accel = False
-
-print(f"{'Accel' if is_accel else 'CPU'} | {len(devices)} devices")
+print(f"Devices: {jax.devices()}")
 
 IS_KAGGLE = os.path.exists("/kaggle/input")
 CFG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
 with open(CFG_PATH, "r") as f:
     cfg = yaml.safe_load(f)
 
-if IS_KAGGLE:
-    BASE = cfg['paths']['kaggle_base']
-    CHUNK_DIR = cfg['paths']['kaggle_chunks']
-    VAL_DIR = cfg['paths']['kaggle_chunks_val']
-else:
-    BASE = cfg['paths']['local_base']
-    CHUNK_DIR = cfg['paths']['local_chunks']
-    VAL_DIR = cfg['paths']['local_chunks_val']
+BASE = cfg['paths']['kaggle_base'] if IS_KAGGLE else cfg['paths']['local_base']
+CHUNK_DIR = cfg['paths']['kaggle_chunks'] if IS_KAGGLE else cfg['paths']['local_chunks']
+VAL_DIR = cfg['paths']['kaggle_chunks_val'] if IS_KAGGLE else cfg['paths']['local_chunks_val']
 
 HP = cfg['hyperparameters']
 IMG_SIZE = HP['img_size']
 BASE_CH = HP['base_channels']
-PER_DEVICE_BATCH = HP['per_device_batch']
 EPOCHS = HP['epochs']
 LR = HP['learning_rate']
 SEED = HP['seed']
@@ -69,6 +59,8 @@ W_DICE = float(HP['w_dice'])
 W_BND = float(HP['w_boundary'])
 
 NUM_DEVICES = max(1, jax.local_device_count())
+# Drop batch size to 8 on GPU to avoid OOM
+PER_DEVICE_BATCH = 8 if jax.devices()[0].platform == "gpu" else HP['per_device_batch']
 GLOBAL_BATCH_SIZE = PER_DEVICE_BATCH * NUM_DEVICES
 
 CHECKPOINT_DIR = "/kaggle/working/checkpoints" if IS_KAGGLE else "./checkpoints"
@@ -76,36 +68,19 @@ LOG_DIR = "/kaggle/working/logs" if IS_KAGGLE else "./tensorboard"
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-assert os.path.isdir(CHUNK_DIR), f"Missing {CHUNK_DIR}."
-assert os.path.isdir(VAL_DIR), f"Missing {VAL_DIR}."
+def load_data(chunk_dir):
+    files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
+    imgs, masks = [], []
+    for f in tqdm(files, desc=f"Loading {os.path.basename(chunk_dir)}"):
+        idx = f.replace('img_', '').replace('.npy', '')
+        imgs.append(np.load(os.path.join(chunk_dir, f)))
+        masks.append(np.load(os.path.join(chunk_dir, f"mask_{idx}.npy")))
+    return np.array(imgs), np.array(masks)
 
-class SolarFilamentDataset(Dataset):
-    def __init__(self, chunk_dir):
-        self.chunk_dir = chunk_dir
-        self.files = sorted([f for f in os.listdir(chunk_dir) if f.startswith('img_') and f.endswith('.npy')])
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        img_file = self.files[idx]
-        idx_str = img_file.replace('img_', '').replace('.npy', '')
-        mask_file = f"mask_{idx_str}.npy"
-        img = np.load(os.path.join(self.chunk_dir, img_file))
-        mask = np.load(os.path.join(self.chunk_dir, mask_file))
-        return img, mask
-
-train_dataset = SolarFilamentDataset(CHUNK_DIR)
-val_dataset = SolarFilamentDataset(VAL_DIR)
-
-train_loader = DataLoader(
-    train_dataset, batch_size=GLOBAL_BATCH_SIZE, shuffle=True, drop_last=True,
-    num_workers=0, pin_memory=False,
-)
-val_loader = DataLoader(
-    val_dataset, batch_size=GLOBAL_BATCH_SIZE, shuffle=False, drop_last=False,
-    num_workers=0, pin_memory=False,
-)
+print("Loading data to Host RAM...")
+X_train, Y_train = load_data(CHUNK_DIR)
+X_val, Y_val = load_data(VAL_DIR)
+print(f"Train: {X_train.shape}, Val: {X_val.shape}")
 
 def augment_jax(img, mask, key):
     k1, k2, k3, k4 = jax.random.split(key, 4)
@@ -150,8 +125,7 @@ class ConvBlock(eqx.Module):
 
     def __call__(self, x):
         x = jax.nn.relu(self.norm1(self.conv1(x)))
-        x = jax.nn.relu(self.norm2(self.conv2(x)))
-        return x
+        return jax.nn.relu(self.norm2(self.conv2(x)))
 
 class UNet(eqx.Module):
     down1: ConvBlock
@@ -233,7 +207,11 @@ def make_train_step(optimizer, ema_decay):
         grads = jax.tree_util.tree_map(lambda g: jax.lax.pmean(g, axis_name='batch'), grads)
         updates, opt_state = optimizer.update(grads, opt_state, eqx.filter(model, eqx.is_array))
         model = eqx.apply_updates(model, updates)
-        ema_model = jax.tree_util.tree_map(lambda e, m: ema_decay * e + (1.0 - ema_decay) * m, ema_model, model)
+
+        ema_model = jax.tree_util.tree_map(
+            lambda e, m: ema_decay * e + (1.0 - ema_decay) * m if (eqx.is_array(e) and eqx.is_array(m)) else m,
+            ema_model, model
+        )
         return model, ema_model, opt_state, jax.lax.pmean(loss, axis_name='batch')
 
     return train_step
@@ -248,16 +226,6 @@ def unbroadcast(pmodel):
             return x[0]
         return x
     return jax.tree_util.tree_map(fn, pmodel)
-
-def validate(model_single):
-    model_bf16 = jax.tree_util.tree_map(lambda p: p.astype(jnp.bfloat16) if eqx.is_array(p) else p, model_single)
-    losses = []
-    for imgs, masks in val_loader:
-        x_in = jnp.array(imgs.numpy())
-        y_in = jnp.array(masks.numpy())
-        x, y = preprocess_val(x_in, y_in)
-        losses.append(float(eval_step_bf16(model_bf16, x, y)))
-    return float(np.mean(losses))
 
 def watershed_labels(binary_mask):
     dist = ndimage.distance_transform_edt(binary_mask)
@@ -388,9 +356,9 @@ def generate_submission(model):
 
 if __name__ == "__main__":
     writer = SummaryWriter(LOG_DIR)
-
     key = jax.random.PRNGKey(SEED)
-    steps_per_epoch = max(1, len(train_dataset) // GLOBAL_BATCH_SIZE)
+
+    steps_per_epoch = max(1, len(X_train) // GLOBAL_BATCH_SIZE)
     total_steps = max(1, steps_per_epoch * EPOCHS)
 
     schedule = optax.warmup_cosine_decay_schedule(
@@ -420,34 +388,47 @@ if __name__ == "__main__":
 
     for epoch in range(EPOCHS):
         ep_loss = 0.0
+        idx = np.random.permutation(len(X_train))
+
         if epoch == 2:
             jax.profiler.start_trace(os.path.join(LOG_DIR, "profiler"))
 
-        for batch_idx, (imgs, masks) in enumerate(train_loader):
+        for batch_idx in range(steps_per_epoch):
+            batch_idx_arr = idx[batch_idx*GLOBAL_BATCH_SIZE : (batch_idx+1)*GLOBAL_BATCH_SIZE]
+
+            x_batch = X_train[batch_idx_arr].reshape(NUM_DEVICES, PER_DEVICE_BATCH, IMG_SIZE, IMG_SIZE)
+            y_batch = Y_train[batch_idx_arr].reshape(NUM_DEVICES, PER_DEVICE_BATCH, IMG_SIZE, IMG_SIZE)
+
             key, subkey = jax.random.split(key)
             keys = jax.random.split(subkey, NUM_DEVICES * PER_DEVICE_BATCH).reshape(NUM_DEVICES, PER_DEVICE_BATCH, -1)
 
-            x_in = jnp.array(imgs.numpy().reshape(NUM_DEVICES, PER_DEVICE_BATCH, IMG_SIZE, IMG_SIZE))
-            y_in = jnp.array(masks.numpy().reshape(NUM_DEVICES, PER_DEVICE_BATCH, IMG_SIZE, IMG_SIZE))
-
-            x, y = preprocess_train(x_in, y_in, keys)
-
+            x, y = preprocess_train(jnp.array(x_batch), jnp.array(y_batch), keys)
             model, ema_model, opt_state, loss = train_step(model, ema_model, opt_state, x, y)
+
             lv = float(jnp.mean(loss))
             ep_loss += lv
             writer.add_scalar('Loss/train_batch', lv, gstep)
             gstep += 1
+
             if batch_idx % 10 == 0:
                 print(f"Epoch {epoch+1} Batch {batch_idx} Loss {lv:.4f}")
+
             if epoch == 2 and batch_idx == 5:
                 jax.profiler.stop_trace()
 
         ema_single = unbroadcast(ema_model)
-        val_loss = validate(ema_single)
-        tl = ep_loss / max(1, len(train_loader))
+
+        val_losses = []
+        for v_idx in range(0, len(X_val), GLOBAL_BATCH_SIZE):
+            vx = X_val[v_idx:v_idx+GLOBAL_BATCH_SIZE]
+            vy = Y_val[v_idx:v_idx+GLOBAL_BATCH_SIZE]
+            vx, vy = preprocess_val(jnp.array(vx), jnp.array(vy))
+            model_bf16 = jax.tree_util.tree_map(lambda p: p.astype(jnp.bfloat16) if eqx.is_array(p) else p, ema_single)
+            val_losses.append(float(eval_step_bf16(model_bf16, vx, vy)))
+
+        val_loss = float(np.mean(val_losses))
+        tl = ep_loss / max(1, steps_per_epoch)
         print(f"Epoch {epoch+1} | Train {tl:.4f} | Val {val_loss:.4f}")
-        writer.add_scalar('Loss/train_epoch', tl, epoch)
-        writer.add_scalar('Loss/val_epoch', val_loss, epoch)
 
         ck = os.path.join(CHECKPOINT_DIR, f"ema_epoch_{epoch+1}.eqx")
         eqx.tree_serialise_leaves(ck, ema_single)
