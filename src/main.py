@@ -68,16 +68,17 @@ def augment_jax(img, mask, key):
 
 @jax.jit
 def preprocess_train(x, y, keys):
-    x = x.astype(jnp.float32) / 255.0
+    # FIXED: No / 255.0
+    x = x.astype(jnp.float32)
     y = y.astype(jnp.float32)
     x, y = jax.vmap(jax.vmap(augment_jax))(x, y, keys)
     return jnp.expand_dims(x, 2).astype(jnp.bfloat16), jnp.expand_dims(y, 2).astype(jnp.bfloat16)
 
 @jax.jit
 def preprocess_val(x, y):
-    x = x.astype(jnp.float32) / 255.0
+    # FIXED: No / 255.0 and axis 1 for channels
+    x = x.astype(jnp.float32)
     y = y.astype(jnp.float32)
-    # FIXED: Channel dim is axis 1 for (Batch, 1, H, W)
     return jnp.expand_dims(x, 1).astype(jnp.bfloat16), jnp.expand_dims(y, 1).astype(jnp.bfloat16)
 
 class ConvBlock(eqx.Module):
@@ -231,7 +232,12 @@ def generate_submission(model, base, test_img_rel, img_size, pos_thr, min_area, 
 
     for idx, fname in enumerate(test_files):
         img_id = os.path.splitext(fname)[0]
-        full_img = np.array(Image.open(os.path.join(test_dir, fname)).convert('L'), dtype=np.float32) / 255.0
+        full_img = np.array(Image.open(os.path.join(test_dir, fname)).convert('L'), dtype=np.float32)
+
+        # Since train images are [0, 1], test images should also be [0, 1]
+        if full_img.max() > 1.0:
+            full_img = full_img / 255.0
+
         H, W = full_img.shape
         pad = max(stride, img_size)
         padded = cv2.copyMakeBorder(full_img, pad, pad, pad, pad, cv2.BORDER_REFLECT)
@@ -295,7 +301,7 @@ def generate_submission(model, base, test_img_rel, img_size, pos_thr, min_area, 
             rle = maskUtils.encode(np.asfortranarray(mm.astype(np.uint8)))
             results.append({'filament_id': f"{img_id}_{k}", 'segmentation_rle': rle['counts'].decode('utf-8')})
 
-    out_csv = "submission.csv"
+    out_csv = "/kaggle/working/submission.csv"
     pd.DataFrame(results, columns=['filament_id', 'segmentation_rle']).to_csv(out_csv, index=False)
     print(f"Saved {out_csv} | {len(results)} rows")
 

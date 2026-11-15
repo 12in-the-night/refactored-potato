@@ -11,10 +11,10 @@ paths:
 
 hyperparameters:
   img_size: 512
-  base_channels: 64       # Keep full model
-  per_device_batch: 16    # Max for T4 (32 Global)
+  base_channels: 32
+  per_device_batch: 16
   epochs: 20
-  learning_rate: 0.001    # Slightly higher LR for larger batch
+  learning_rate: 0.001
   seed: 13
   ema_decay: 0.999
   warmup_steps: 100
